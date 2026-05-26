@@ -1,0 +1,18 @@
+{
+  "workspace_url": "https://YOUR-WORKSPACE.slack.com/",
+  "vault_path": "~/vault",
+  "capture_dir": "slack-captures",
+  "chrome_profile": "~/.slack-harvest-profile",
+  "poll_interval": 60,
+  "reactions": [
+    "cap",
+    "bookmark",
+    "pushpin",
+    "floppy_disk",
+    "memo",
+    "eyes",
+    "point_up",
+    "noted"
+  ],
+  "opencode_command": "opencode"
+}

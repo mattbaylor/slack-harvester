@@ -1,0 +1,21 @@
+# User config (contains paths specific to each person)
+config.json
+
+# Chrome profile
+.slack-harvest-profile/
+
+# State files (local to each vault)
+_state/
+_pending/
+seen.json
+*-cache.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
