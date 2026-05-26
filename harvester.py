@@ -454,7 +454,11 @@ class CaptureWorker:
             if host and host != "app":
                 workspace = host
 
-        # Step 7: Build the bundle for opencode
+        # Step 7: Convert Slack ts to ISO datetime
+        msg_date = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        reacted_text = msg.get("text", "")
+
+        # Step 8: Build the bundle for opencode
         bundle = {
             "channel": channel_name,
             "channel_id": channel,
@@ -462,13 +466,15 @@ class CaptureWorker:
             "author": author,
             "participants": sorted(participants),
             "permalink": permalink,
+            "message_date": msg_date,
+            "reacted_message_text": reacted_text,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "slack_ts": ts,
             "thread_ts": thread_ts,
             "context_type": context_type,
             "reacted_message": {
                 "user": author,
-                "text": msg.get("text", ""),
+                "text": reacted_text,
                 "ts": ts,
             },
             "messages": [
@@ -493,7 +499,7 @@ class CaptureWorker:
             ],
         }
 
-        # Step 8: Invoke opencode
+        # Step 9: Invoke opencode
         self._invoke_opencode(bundle)
 
     def _invoke_opencode(self, bundle: dict):
@@ -528,6 +534,8 @@ channel: "{bundle['channel']}"
 author: "{bundle['author']}"
 participants: {json.dumps(bundle['participants'])}
 permalink: {bundle['permalink']}
+message_date: {bundle['message_date']}
+reacted_message: "{bundle['reacted_message_text'][:200]}"
 captured_at: {bundle['captured_at']}
 slack_ts: "{bundle['slack_ts']}"
 tags: []
