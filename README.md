@@ -53,7 +53,12 @@ python3 harvester.py          # uses config.json in the same directory
 python3 harvester.py -v       # verbose logging
 ```
 
-The harvester runs as a foreground process. To run it in the background:
+The harvester runs as a foreground process. To run it as a managed background
+service that survives reboots and gets auto-restarted on crash, install it
+under launchd (recommended for daily use — see "Run as a background service"
+below).
+
+For a quick one-off background run:
 
 ```bash
 nohup python3 harvester.py > /tmp/harvester.log 2>&1 &
@@ -64,6 +69,57 @@ Health check endpoint at `http://localhost:7777/health`:
 ```bash
 curl -s localhost:7777/health | python3 -m json.tool
 ```
+
+## Run as a background service (macOS, recommended)
+
+After `./setup.sh` succeeds and you can run the harvester manually, install it
+as a launchd agent so it starts on login and gets a periodic healthcheck:
+
+```bash
+./install-launchd.sh
+```
+
+This:
+
+1. Installs `cryptography` to `~/.local/lib/slack-harvester-deps/` so the
+   launchd-spawned `/usr/bin/python3` finds it regardless of pyenv shims or
+   per-user site changes.
+2. Probes `opencode` under a launchd-equivalent env to confirm model auth works
+   (catches "works in my shell, breaks under launchd" early).
+3. Renders the launchd plists from
+   `com.example.slack-harvester.plist.example` and
+   `com.example.slack-harvester-healthcheck.plist.example`, substituting your
+   paths and chosen label namespace.
+4. Bootstraps both services. They start now and on every login.
+
+Why a dedicated installer (vs. "just symlink the plist"):
+
+- **`HOME` must be inherited from the user session**, not set inside the plist.
+  opencode reads `~/.local/share/opencode/auth.json` to pick a model provider;
+  overriding `HOME` will silently route to a different auth file and a
+  non-existent model. This was a load-bearing bug. The template intentionally
+  does not set `HOME`.
+- **`opencode` must be authenticated to a working model** (e.g. GitHub Copilot
+  OAuth) before launchd will produce captures. The installer probes for this
+  upfront so failures happen at install time, not in production.
+- **The `cryptography` dep path needs to be stable.** User-site or pyenv paths
+  drift; the installer pins a path that survives Python upgrades.
+
+After install:
+
+```bash
+# Logs
+tail -f /private/tmp/harvester.log
+tail -f /private/tmp/harvester-healthcheck.log
+
+# Control (substitute your chosen namespace, default is com.<your-username>.*)
+launchctl print gui/$(id -u)/com.<NS>.slack-harvester
+launchctl kickstart -k gui/$(id -u)/com.<NS>.slack-harvester       # restart
+launchctl bootout gui/$(id -u)/com.<NS>.slack-harvester             # stop
+```
+
+The healthcheck DMs you on Slack via the harvester's own credentials if the
+service is down or unhealthy for >5 minutes. Cooldown is 30 min between alerts.
 
 ## Configuration
 
@@ -157,6 +213,12 @@ The harvester reads Slack's `xoxc` session token from Chrome's `localStorage` Le
 - **macOS only** — cookie decryption depends on the macOS Keychain. Linux would need a different decryption path.
 - **`xoxc` token scope** — some Slack API methods don't work with session tokens. The harvester uses `search.messages` (which works) instead of `reactions.list` (which doesn't).
 - **One workspace** — the config supports a single workspace. For multiple workspaces, run separate instances with separate configs.
+
+## Known issues and design notes
+
+See [ISSUES.md](./ISSUES.md). It tracks defects, design decisions, and the
+diagnostic trail from past silent-failure incidents. **Read it before modifying
+`harvester.py`** — several non-obvious failure modes are documented there.
 
 ## License
 

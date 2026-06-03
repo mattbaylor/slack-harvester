@@ -14,10 +14,27 @@ if [ -n "${HARVESTER_PYTHONPATH:-}" ]; then
     export PYTHONPATH="${PYTHONPATH:-}:${HARVESTER_PYTHONPATH}"
 fi
 
-HEALTH_URL="http://127.0.0.1:7777/health"
-STATE_DIR="/Users/matt/.local/state/slack-harvester"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="$SCRIPT_DIR/config.json"
+
+# Read state_dir and health port from config.json so this script doesn't
+# carry user-specific paths.
+if [ -f "$CONFIG" ]; then
+    STATE_DIR=$(python3 -c "import json, os; c=json.load(open('$CONFIG')); print(os.path.expanduser(c.get('state_dir', '~/.local/state/slack-harvester')))")
+    HEALTH_PORT=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('health_port', 7777))")
+else
+    STATE_DIR="$HOME/.local/state/slack-harvester"
+    HEALTH_PORT=7777
+fi
+mkdir -p "$STATE_DIR"
+
+HEALTH_URL="http://127.0.0.1:$HEALTH_PORT/health"
 ALERT_COOLDOWN_FILE="$STATE_DIR/.last-alert"
 COOLDOWN_SECONDS=1800  # Don't re-alert within 30 minutes
+
+# Label of the launchd job, for the restart hint in the alert message. Falls
+# back to the conventional template if not set in the plist.
+HARVESTER_LABEL="${HARVESTER_LAUNCHD_LABEL:-com.<your-namespace>.slack-harvester}"
 
 # --- Check cooldown ---
 if [ -f "$ALERT_COOLDOWN_FILE" ]; then
@@ -107,7 +124,7 @@ PYEOF
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('channel',{}).get('id',''))" 2>/dev/null || echo "")
 
             if [ -n "$dm_channel" ]; then
-                msg=":rotating_light: *Slack Harvester is down*\n\n$reason\n\nCheck: \`tail -50 /private/tmp/harvester.log\`\nRestart: \`launchctl kickstart gui/\$(id -u)/com.baylor.slack-harvester\`"
+                msg=":rotating_light: *Slack Harvester is down*\n\n$reason\n\nCheck: \`tail -50 /private/tmp/harvester.log\`\nRestart: \`launchctl kickstart gui/\$(id -u)/$HARVESTER_LABEL\`"
 
                 curl -s -m 10 \
                     -H "Authorization: Bearer $token" \

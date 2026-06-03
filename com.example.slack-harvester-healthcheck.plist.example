@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Slack Harvester healthcheck — runs every 5 minutes.
+
+  Template. Render with install-launchd.sh, which substitutes:
+    {{LABEL}}            e.g. com.yourname.slack-harvester-healthcheck
+    {{HARVESTER_LABEL}}  the main harvester's label, used in alert messages
+    {{REPO_PATH}}        absolute path to this repo on disk
+    {{DEPS_PATH}}        absolute path to the cryptography install
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{LABEL}}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{REPO_PATH}}/healthcheck.sh</string>
+  </array>
+
+  <!-- Run every 5 minutes. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!--
+      healthcheck.sh reads HARVESTER_PYTHONPATH (not PYTHONPATH directly)
+      so the script can ship generic. See the env-var dance at the top of
+      healthcheck.sh.
+    -->
+    <key>HARVESTER_PYTHONPATH</key>
+    <string>{{DEPS_PATH}}</string>
+    <!-- Label of the main harvester job; healthcheck.sh embeds it in alert text. -->
+    <key>HARVESTER_LAUNCHD_LABEL</key>
+    <string>{{HARVESTER_LABEL}}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/private/tmp/harvester-healthcheck.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/private/tmp/harvester-healthcheck.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

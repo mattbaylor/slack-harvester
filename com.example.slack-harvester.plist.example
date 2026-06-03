@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Slack Harvester — launchd agent.
+
+  Template. Render with install-launchd.sh, which substitutes:
+    {{LABEL}}        e.g. com.yourname.slack-harvester
+    {{REPO_PATH}}    absolute path to this repo on disk
+    {{DEPS_PATH}}    absolute path to the cryptography install
+                     (e.g. ~/.local/lib/slack-harvester-deps)
+
+  Notes on env vars (lessons learned the hard way):
+
+  - HOME is NOT set here. opencode reads ~/.local/share/opencode/auth.json
+    to pick a model provider. Overriding HOME here will route opencode
+    to a different auth file and a different model — silently. Leave it
+    unset so the agent inherits the real $HOME (/Users/<you>).
+
+  - PATH includes /opt/homebrew/bin so launchd can resolve `opencode`
+    when the harvester subprocess-runs it.
+
+  - PYTHONPATH points at a stable deps dir, not a per-Python user-site.
+    User-site paths can move with Python upgrades or pyenv shims.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{LABEL}}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>{{REPO_PATH}}/harvester.py</string>
+    <string>-v</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{REPO_PATH}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>{{DEPS_PATH}}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart on unexpected exit (crash, OOM kill, etc.). Does NOT restart
+    on clean SIGTERM, so `launchctl bootout ... | kickstart -k` still works.
+  -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/private/tmp/harvester.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/private/tmp/harvester.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Wait at least 30s between respawn attempts if the process crashes. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>

@@ -151,7 +151,7 @@ When silent-failure mode strikes:
 3. `ls -la ~/vault/51-slack-captures/$(date +%Y-%m-%d)/` — confirm presence/absence of file.
 4. `ls -lat ~/.local/share/opencode/log/` — find the log timestamp matching the harvester's processing window. Real-home opencode logs, *not* any sandbox's `~/.local/share/opencode/log/` (different `$HOME`).
 5. `ls -lat ~/.local/share/opencode/snapshot/` and `tool-output/` — these get written when opencode actually runs tools. If they're not fresh, opencode never called a tool.
-6. Replay manually: `env -i PATH="/Users/matt/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME=/Users/matt /opt/homebrew/bin/opencode run --dir ~/vault "<copy of the prompt from harvester.py:515 with {bundle} interpolated>"` — observe stdout.
+6. Replay manually: `env -i PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME" /opt/homebrew/bin/opencode run --dir ~/vault "<copy of the prompt from harvester.py:515 with {bundle} interpolated>"` — observe stdout.
 
 Two opencode installations gotcha:
 
