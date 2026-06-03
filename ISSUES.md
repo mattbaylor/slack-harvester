@@ -4,6 +4,8 @@ Defect tracker. Triaged 2026-06-03 after a silent-failure incident where a captu
 
 Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 
+**Priority-1 PR landed 2026-06-03:** Pivoted from "opencode does the file write" to "opencode generates body text on stdout, Python writes the file." Structurally eliminates #1 and #5. Also ships: #2 (un-mark seen on failure), #9a (startup self-test, simplified to a stdout PONG probe), #10 (recovery sweep on startup).
+
 ## Triggering incident
 
 - 2026-06-03 13:14:53 local: `:cap:` on `#team-ux-admin` ts `1780513854.323999`. Harvester logged `Capture written for #team-ux-admin/1780513854.323999` at 13:15:05. `seen.json` updated. **No file in `~/vault/51-slack-captures/2026-06-03/`.** `opencode run` returned rc=0 but never wrote.
@@ -14,46 +16,45 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 
 ## Priority 1 — silent failures (data loss)
 
-### #1 — 🔴 Success inferred from `rc=0`, not from "file exists"
+### #1 — 🟢 Success inferred from `rc=0`, not from "file exists" (FIXED via redesign)
 
-**Where:** `harvester.py:507-577` (`_invoke_opencode`)
+**Where:** `harvester.py:_invoke_opencode`
 **Symptom:** Log says "Capture written" but no markdown file lands in the vault. `seen.json` records the capture as done, so it never retries.
-**Cause:** `opencode run` exits 0 in many non-write paths (model produced a plan instead of a tool call; write denied silently; permission prompt with no TTY; prompt parsed as `--help`).
-**Fix:**
-- Snapshot `out_dir` file list before `subprocess.run`, diff after.
-- If no new `.md` appeared, raise — `_park_pending` writes JSON + (per #2) un-marks seen.
-- Log `result.stdout[:500]` and `result.stderr[:500]` at INFO on every invocation (gate verbose dump behind `-v`).
+**Cause:** `opencode run` exits 0 in many non-write paths (model produced a plan instead of a tool call; write denied silently; permission prompt with no TTY; prompt parsed as `--help`; etc.). Confirmed observable cause: when invoked from a parent OpenCode session via `subprocess.run`, the child inherits `OPENCODE_PID` / `OPENCODE_RUN_ID` / `OPENCODE_CONFIG` env vars and runs as a nested session that silently no-ops Write tool calls. Launchd-spawned invocations don't inherit these env vars, but the same class of silent-failure exists for other rc=0-no-write paths.
+**Fix shipped:** Redesigned `_invoke_opencode` so opencode never writes files. Opencode is called stdout-only ("return the body text, do not invoke tools"). Python computes the slug, builds frontmatter, writes the file, verifies it landed. Structurally impossible for opencode to silently succeed-without-writing now — if stdout is empty the harvester raises; if stdout has content, the file write is Python's job and Python knows when `write_text` returned.
 
-### #2 — 🔴 `mark_seen` happens before opencode runs, no rollback on failure
+### #2 — 🟢 `mark_seen` happens before opencode runs, no rollback on failure (FIXED, option a)
 
-**Where:** `harvester.py:372-373`
+**Where:** `harvester.py:CaptureWorker._run`
 **Symptom:** Any opencode failure permanently removes the capture from the retry queue. User has to manually delete the `seen.json` entry to replay.
-**Cause:** "Mark seen before processing" was a deliberate idempotency choice (per [design doc](~/vault/00-inbox/2026-05-26-slack-harvester-design.md)) to prevent retry storms on success. But the failure path was never finished — `_park_pending` writes a JSON dump and that's it.
-**Fix (chosen — option a):** On failure path, `_park_pending` also calls `state.unmark_seen(dedup_key)` so the next poll retries automatically. Accept the risk of tight retry loops on deterministically-broken messages; mitigate via #3 (alert on pending growth).
+**Cause:** "Mark seen before processing" was a deliberate idempotency choice to prevent retry storms on success. The failure path was never finished — `_park_pending` writes a JSON dump and that's it.
+**Fix shipped:** Worker's exception handler now calls `state.unmark_seen(dedup_key)` after `_park_pending` so the next poll retries automatically. Accept the risk of tight retry loops on deterministically-broken messages; will mitigate via #3 (alert on pending growth) when implemented.
 **Alternative (option b, deferred):** Keep seen-before-process, build a `harvester replay` command that re-enqueues from `_pending/` without touching `seen.json`. Cleaner long-term shape if option a's retry loops become a problem in practice.
 
-### #10 — 🔴 No historical-loss recovery (fold into priority-1 PR)
+### #10 — 🟢 No historical-loss recovery (FIXED)
 
 **Symptom:** Once a capture is silently lost (rc=0, no file, `seen.json` marked), there is no automated recovery. The user must manually delete the `seen.json` entry. The 2026-05-27 timeout-orphan sat lost for 7 days; the 2026-06-03 13:14:53 message is currently lost.
 **Fix:** On harvester startup, sweep `seen.json` for entries with no corresponding `.md` file in the expected dated dir (`{vault}/{capture_dir}/{date_from_iso}/`). For each orphan, un-mark from `seen.json` so the next poll re-processes. Log a summary at INFO: `Recovery sweep: un-marked N historical orphans`.
 **Caveat:** This will replay every historical silent loss on first run after deploy. That's the intent. Subsequent runs find nothing to un-mark.
 **Notes for implementer:** Skip the sweep for entries older than ~30 days — Slack's `search.messages` may not return very old reactions, and we don't want a runaway-replay loop. Also skip when `_pending/{ts}.json` exists for the same dedup key (that's a known-failed message with a paper trail, not a silent loss).
 
-### #9 — 🔴 Reboot-fragile, no init-time self-test
+### #9 — 🟡 Reboot-fragile, no init-time self-test (PARTIAL: #9a fixed; #9b/c/d/e open)
 
 **Symptom:** Today's 13:14:53 silent failure was the first capture attempt after a morning reboot. Same pattern as 2026-05-27 (single failed capture, no further failures that day).
 **Candidates for the actual reboot-induced failure:**
 - **9a** Chrome profile lock from unclean Chrome shutdown → `chrome_creds.read_credentials` fails silently or returns stale data.
-- **9b** Sandbox path rot: `config.json` → `chrome_profile: ~/.local/state/jh-code/sandboxes/ef3ef8c6f8de8799/...`. The hash is from a previous jh-code sandbox; current sandbox is `f4ecbd62229d0e22`. If jh-code rotates sandboxes the path stops existing.
+- **9b** Sandbox path rot: `config.json` → `chrome_profile` points at a path inside a sandbox-managed directory whose name includes a rotating hash. If the sandbox rotates (reboot, reinstall, version bump), the path stops existing.
 - **9c** Cookie decryption races Keychain unlock: launchd may start harvester before user login completes, before Keychain is unlocked, so cookie decrypt fails on the first poll.
 - **9d** opencode 1.15.5 persistent daemon not running post-boot; first `opencode run` triggers cold-start (auth init, model registry, possible WAL recovery on `opencode.db`); race conditions plausible.
 - **9e** `healthcheck.sh` cooldown file persists across reboot, suppressing alerts for up to 30 min post-boot.
 
-**Fix:** Init-time self-test in `harvester.py` startup that:
-1. Calls Slack `auth.test` and logs the result.
-2. Runs `opencode run "echo OK"` against a temp dir and verifies a probe file lands.
-3. DMs Matt immediately on any failure (don't wait for the 5-min healthcheck cycle).
-4. Also: `launchctl` plist gets `KeepAlive { SuccessfulExit: false }` so a crash auto-restarts.
+**#9a fix shipped:** `startup_self_test()` in `harvester.py` runs at startup with two probes — Slack `auth.test` and an opencode stdout round-trip ("reply with PONG"). On any failure, DMs Matt immediately via `_dm_self()`. Doesn't block startup; harvester continues so partial outages still park to `_pending/`.
+**Still open:**
+- KeepAlive plist change (manual edit to `~/Library/LaunchAgents/com.baylor.slack-harvester.plist`).
+- #9b chrome-profile path is sandbox-coupled (tracked below).
+- #9c healthcheck doesn't exercise the pipeline (tracked below).
+- #9d opencode db integrity check (tracked below).
+- #9e healthcheck cooldown survives reboot (low priority).
 
 ---
 
@@ -86,12 +87,11 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 
 ## Priority 3 — blast radius
 
-### #5 — 🔴 Prompt relies on instruction-following for safety
+### #5 — 🟢 Prompt relies on instruction-following for safety (FIXED via redesign)
 
 **Where:** `harvester.py:515-558`
 **Symptom:** Prompt says "Create exactly ONE file at: `{cap_dir}/{date_str}/{{slug}}.md`" and "Do NOT edit any other files in the vault." If a model misinterprets `{slug}` as a literal or decides the better path is to "update" an existing daily log, no guardrail catches it.
-**Fix (chosen — 5b):** Use `--agent` with a stripped-down agent definition that has **write access scoped to `51-slack-captures/**` only**. opencode permissions support path-scoped denies; use them.
-**Bonus:** Pre-compute the slug in Python from `bundle['author']` and the message text, pass an absolute output path. Tell the model the *path* not the *naming scheme*.
+**Fix shipped:** Pivoted to stdout-only opencode invocation (see #1). Opencode no longer has any path to write to the filesystem — the prompt explicitly says "Do not invoke any tools. Do not write to any files." Slug and frontmatter are computed in Python (`_build_slug`, `_build_frontmatter`). Blast radius collapses to "opencode returns wrong body text," which is recoverable and visible.
 
 ### #6 — 🔴 No fallback when search-API credentials silently 401
 
@@ -101,7 +101,7 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 ### #9b — 🔴 Chrome profile path is sandbox-coupled
 
 **Where:** `config.json` → `chrome_profile`
-**Symptom:** Path contains a jh-code sandbox hash that has rotated since config was written. One reboot or jh-code reinstall away from a hard breakage.
+**Symptom:** Path contains a sandbox hash that rotates with the sandbox runtime. One reboot or sandbox-runtime reinstall away from a hard breakage.
 **Fix:** Move `.slack-harvest-profile` to a stable location:
 - `~/Library/Application Support/SlackHarvest/profile/`, or
 - `~/.local/state/slack-harvester/chrome-profile/`
@@ -114,7 +114,7 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 
 ### #4 — 🔴 Two opencode installations diverge silently
 
-**Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is jh-code-sandboxed pnpm-dlx opencode (separate state dir, separate auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
+**Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
 **Fix:** Pass `--model github-copilot/claude-opus-4.7` (or equivalent) explicitly to `opencode run`. Optionally pin opencode binary version via `opencode_command` in config.
 
 ---
@@ -130,16 +130,15 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 
 ## Execution order
 
-| Step | Issues | Rationale |
+| Step | Issues | Status |
 |---|---|---|
-| 1 | #1, #2, #9a, #10 | One PR. Kills the silent-failure class that started this. Recovers today's 13:14:53 message and the 2026-05-27 orphan via #10's sweep. |
-| 2 | #9b | Independent, low-risk, eliminates reboot fragility class. |
-| 3 | #5 | Reduce blast radius before piling on more features. |
-| 4 | #3, #7 | Observability — should land before adding more failure modes. |
-| 5 | #9c, #9d | Deeper healthcheck probes. |
-| 6 | #8 | Cleanup. |
-| 7 | #4 | Pin model. |
-| — | #6 | Fold into #1 work (verify the 401-path actually flips `has_credentials`). |
+| 1 | #1, #2, #5, #9a, #10 | 🟢 Shipped 2026-06-03. Stdout-only redesign + un-mark-on-failure + recovery sweep + startup self-test. |
+| 2 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
+| 3 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
+| 4 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |
+| 5 | #8 | 🔴 Cleanup orphaned vault dirs. |
+| 6 | #4 | 🔴 Pin model. |
+| 7 | #6 | 🔴 Verify 401-path flips `has_credentials`. |
 
 ---
 
@@ -150,7 +149,7 @@ When silent-failure mode strikes:
 1. `curl -s http://127.0.0.1:7777/health | jq` — `has_credentials`, `queue_depth`, `seen_count`.
 2. `tail -F /private/tmp/harvester.log` — look for `Processing capture: …` followed by `Capture written for …` with no errors. That's the silent-failure signature.
 3. `ls -la ~/vault/51-slack-captures/$(date +%Y-%m-%d)/` — confirm presence/absence of file.
-4. `ls -lat ~/.local/share/opencode/log/` — find the log timestamp matching the harvester's processing window. Real-home opencode logs, *not* the jh-code sandbox `~/.local/share/opencode/log/` (different `$HOME`).
+4. `ls -lat ~/.local/share/opencode/log/` — find the log timestamp matching the harvester's processing window. Real-home opencode logs, *not* any sandbox's `~/.local/share/opencode/log/` (different `$HOME`).
 5. `ls -lat ~/.local/share/opencode/snapshot/` and `tool-output/` — these get written when opencode actually runs tools. If they're not fresh, opencode never called a tool.
 6. Replay manually: `env -i PATH="/Users/matt/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME=/Users/matt /opt/homebrew/bin/opencode run --dir ~/vault "<copy of the prompt from harvester.py:515 with {bundle} interpolated>"` — observe stdout.
 
@@ -159,6 +158,6 @@ Two opencode installations gotcha:
 | Install | Path | State dir | Used by |
 |---|---|---|---|
 | Homebrew 1.15.5 | `/opt/homebrew/bin/opencode` | `~/.local/share/opencode/` | harvester (launchd) |
-| jh-code sandbox | `~/Library/Caches/pnpm/dlx/.../opencode` | `~/.local/state/jh-code/sandboxes/<hash>/home/.local/share/opencode/` | interactive agent sessions |
+| pnpm-dlx (sandboxed) | `~/Library/Caches/pnpm/dlx/.../opencode` | `<sandbox-home>/.local/share/opencode/` | interactive agent sessions |
 
 When debugging, confirm which one you're looking at logs for.
