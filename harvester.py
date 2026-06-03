@@ -41,6 +41,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULTS = {
     "vault_path": "~/vault",
     "capture_dir": "slack-captures",
+    "state_dir": "~/.local/state/slack-harvester",
     "chrome_profile": "~/.slack-harvest-profile",
     "poll_interval": 60,
     "health_port": 7777,
@@ -74,11 +75,12 @@ log = logging.getLogger("harvester")
 class HarvesterState:
     """Thread-safe state container."""
 
-    def __init__(self, vault: Path, capture_dir: str, chrome_profile: Path):
+    def __init__(self, vault: Path, capture_dir: str, chrome_profile: Path,
+                 state_dir: Optional[Path] = None):
         self.vault = vault
         self.capture_dir = capture_dir
         self.chrome_profile = chrome_profile
-        self.state_dir = vault / capture_dir / "_state"
+        self.state_dir = state_dir or (vault / capture_dir / "_state")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (vault / capture_dir / "_pending").mkdir(parents=True, exist_ok=True)
 
@@ -121,6 +123,100 @@ class HarvesterState:
         with self._lock:
             self.seen[key] = datetime.now(timezone.utc).isoformat()
             self._save_json(self.seen_path, self.seen)
+
+    def unmark_seen(self, key: str):
+        """Remove a key from seen.json. Used to retry failed captures.
+
+        See ISSUES.md #2 — failure path un-marks so the next poll re-processes.
+        """
+        with self._lock:
+            if key in self.seen:
+                del self.seen[key]
+                self._save_json(self.seen_path, self.seen)
+                log.info("Un-marked seen: %s (will retry on next poll)", key)
+
+    def find_orphaned_seen(self, max_age_days: int = 30) -> list[str]:
+        """Find seen.json entries with no corresponding capture file on disk.
+
+        These are silent losses — opencode returned rc=0 (so we marked seen)
+        but never wrote a file. See ISSUES.md #10.
+
+        Skips:
+        - entries older than max_age_days (Slack search.messages may not return
+          ancient reactions, so un-marking is futile)
+        - entries with a matching _pending/*.json (these are known-failed with
+          a paper trail, not silent losses)
+
+        Returns the list of orphaned dedup keys.
+        """
+        capture_root = self.vault / self.capture_dir
+        pending_dir = capture_root / "_pending"
+        cutoff = datetime.now(timezone.utc).timestamp() - (max_age_days * 86400)
+
+        # Build a set of pending dedup keys (channel:ts) for skip-check.
+        pending_keys: set[str] = set()
+        if pending_dir.exists():
+            for pf in pending_dir.glob("*.json"):
+                try:
+                    payload = json.loads(pf.read_text())
+                    ev = payload.get("event", {})
+                    ch, ts = ev.get("channel"), ev.get("ts")
+                    if ch and ts:
+                        pending_keys.add(f"{ch}:{ts}")
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+        orphans: list[str] = []
+        with self._lock:
+            for key, marked_iso in self.seen.items():
+                # Skip if there's a paper trail in _pending/.
+                if key in pending_keys:
+                    continue
+
+                # Parse the dedup key's Slack ts (key is "channel:ts").
+                try:
+                    _, ts_str = key.split(":", 1)
+                    msg_ts = float(ts_str)
+                except (ValueError, IndexError):
+                    continue
+                if msg_ts < cutoff:
+                    continue
+
+                # Date-dir to check is derived from the message ts (UTC),
+                # matching _invoke_opencode's date_str logic.
+                msg_date = datetime.fromtimestamp(msg_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                date_dir = capture_root / msg_date
+                if not date_dir.exists():
+                    orphans.append(key)
+                    continue
+
+                # Look for any .md file referencing this slack_ts in frontmatter.
+                # Capture file names use a slug, not the ts, so we have to grep.
+                found = False
+                for md in date_dir.glob("*.md"):
+                    try:
+                        # Cheap check: ts string appears in the first 2KB
+                        # (frontmatter `slack_ts:` line).
+                        head = md.read_text()[:2048]
+                        if ts_str in head:
+                            found = True
+                            break
+                    except OSError:
+                        continue
+                if not found:
+                    orphans.append(key)
+
+        return orphans
+
+    def recovery_sweep(self, max_age_days: int = 30) -> int:
+        """Find and un-mark orphaned seen entries. Returns count un-marked.
+
+        See ISSUES.md #10.
+        """
+        orphans = self.find_orphaned_seen(max_age_days=max_age_days)
+        for key in orphans:
+            self.unmark_seen(key)
+        return len(orphans)
 
     def refresh_credentials(self):
         """Read credentials from Chrome profile on disk."""
@@ -409,6 +505,11 @@ class CaptureWorker:
             except Exception as e:
                 log.error("Capture failed: %s", e, exc_info=True)
                 self._park_pending(event, str(e))
+                # Un-mark seen so the next poll retries this capture.
+                # ISSUES.md #2 — without this, any opencode failure
+                # permanently loses the capture.
+                dedup_key = f"{event.get('channel')}:{event.get('ts')}"
+                self.state.unmark_seen(dedup_key)
             finally:
                 self.queue.task_done()
 
@@ -503,14 +604,50 @@ class CaptureWorker:
         self._invoke_opencode(bundle)
 
     def _invoke_opencode(self, bundle: dict):
+        """Generate markdown body via opencode (stdout-only), write file in Python.
+
+        Splitting the responsibilities:
+        - opencode: turns the Slack bundle into curated markdown body text.
+          Stdout-only; no filesystem access required.
+        - Python: computes the slug, builds frontmatter, writes the file,
+          verifies it landed on disk.
+
+        This eliminates the silent-failure class where opencode returns rc=0
+        but never invokes a Write tool (ISSUES.md #1). Also reduces blast
+        radius (#5) — opencode has no path to write outside our control.
+        """
         cap_dir = self.state.capture_dir
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        msg_ts = float(bundle["slack_ts"])
+        date_str = datetime.fromtimestamp(msg_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         out_dir = self.state.vault / cap_dir / date_str
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        bundle_json = json.dumps(bundle, indent=2)
+        body = self._generate_body_via_opencode(bundle)
+        slug = self._build_slug(bundle, date_str)
+        frontmatter = self._build_frontmatter(bundle)
 
-        prompt = f"""You are processing a captured Slack message. Write it to the vault as a single Markdown file.
+        out_path = out_dir / f"{slug}.md"
+        # Guard against slug collisions (same author + same 3-word topic on
+        # the same day). Append a suffix derived from the slack ts.
+        if out_path.exists():
+            suffix = bundle["slack_ts"].replace(".", "")[-6:]
+            out_path = out_dir / f"{slug}-{suffix}.md"
+
+        out_path.write_text(frontmatter + "\n" + body.strip() + "\n")
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError(f"Wrote {out_path} but file is missing or empty")
+
+        log.info("Capture written: %s (%d bytes)",
+                 out_path.relative_to(self.state.vault), out_path.stat().st_size)
+
+    def _generate_body_via_opencode(self, bundle: dict) -> str:
+        """Run opencode to turn the bundle into curated markdown body text.
+
+        Returns the body string. Raises RuntimeError on any failure mode
+        (non-zero rc, timeout, empty stdout).
+        """
+        bundle_json = json.dumps(bundle, indent=2)
+        prompt = f"""You are processing a captured Slack message. Return ONLY the markdown body text. No frontmatter. No preamble. No "Here is the markdown" wrapper. No code fence around the whole output. Just the body content, ready to be appended to a markdown file.
 
 ## Input data (JSON)
 
@@ -518,43 +655,18 @@ class CaptureWorker:
 {bundle_json}
 ```
 
-## Instructions
+## Body requirements
 
-1. Create exactly ONE file at: `{cap_dir}/{date_str}/{{slug}}.md`
-   - Slug format: `{date_str}-{{author-lastname}}-{{3-word-summary}}`
-   - Use lowercase, hyphens, no spaces
-   - The 3-word summary should capture the core topic
+- Start with a 1-2 sentence summary of what was captured and why it matters.
+- Include the key content — decisions, action items, links, important context.
+- If this is a thread, preserve the thread structure with author attribution.
+- If this is channel context, focus on the reacted message and include relevant surrounding context only.
+- Filter out noise (reactions-only messages, "thanks", join/leave, etc.).
+- For references to people, use `[[Display Name]]` wiki-links.
+- Preserve code blocks, links, and structured data inside the body.
 
-2. Frontmatter (YAML):
-```yaml
----
-source: slack
-workspace: {bundle['workspace']}
-channel: "{bundle['channel']}"
-author: "{bundle['author']}"
-participants: {json.dumps(bundle['participants'])}
-permalink: {bundle['permalink']}
-message_date: {bundle['message_date']}
-reacted_message: "{bundle['reacted_message_text'][:200]}"
-captured_at: {bundle['captured_at']}
-slack_ts: "{bundle['slack_ts']}"
-tags: []
----
-```
-
-3. Body:
-   - Start with a 1-2 sentence summary of what was captured and why it matters
-   - Include the key content — decisions, action items, links, important context
-   - If this is a thread, preserve the thread structure with author attribution
-   - If this is channel context, focus on the reacted message and include relevant surrounding context only
-   - Filter out noise (reactions-only messages, "thanks", join/leave, etc.)
-   - If you find references to people, use [[Display Name]] wiki-links
-   - Preserve any code blocks, links, or structured data
-
-4. Do NOT edit any other files in the vault.
-5. Do NOT create more than one file.
+Return only the markdown body. Do not invoke any tools. Do not write to any files. Do not output anything other than the body text.
 """
-
         try:
             result = subprocess.run(
                 [self.opencode_cmd, "run", prompt],
@@ -563,16 +675,91 @@ tags: []
                 timeout=120,
                 cwd=str(self.state.vault),
             )
-
-            if result.returncode != 0:
-                log.error("opencode failed (rc=%d): %s", result.returncode, result.stderr[:500])
-                raise RuntimeError(f"opencode exited {result.returncode}: {result.stderr[:200]}")
-
-            log.info("Capture written for %s/%s", bundle["channel"], bundle["slack_ts"])
-
         except subprocess.TimeoutExpired:
             log.error("opencode timed out after 120s")
             raise RuntimeError("opencode timed out")
+
+        stdout = result.stdout or ""
+        stderr = (result.stderr or "").strip()
+
+        if stderr:
+            # opencode prints ANSI escape codes and the agent/model banner
+            # to stderr. Log it summarized for diagnostic value.
+            log.debug("opencode stderr: %s", stderr[:300])
+
+        if result.returncode != 0:
+            log.error("opencode failed (rc=%d): %s", result.returncode, stderr[:200])
+            raise RuntimeError(f"opencode exited {result.returncode}: {stderr[:200]}")
+
+        body = stdout.strip()
+        if not body:
+            raise RuntimeError(
+                f"opencode returned empty stdout (rc=0, stderr: {stderr[:200]!r})"
+            )
+
+        return body
+
+    @staticmethod
+    def _build_slug(bundle: dict, date_str: str) -> str:
+        """Build a filename slug: `{date}-{author-last-name}-{3-word-topic}`.
+
+        Deterministic, no model involvement. Derives the topic from the
+        reacted message's first words, lowercased, alphanumeric only.
+        """
+        import re
+
+        # Author last name. "First Last" -> "last". Falls back to full
+        # display name slugified if there's no obvious split.
+        author = bundle.get("author") or "unknown"
+        author_parts = author.strip().split()
+        last_name = author_parts[-1] if author_parts else "unknown"
+        last_name_slug = re.sub(r"[^a-z0-9]+", "", last_name.lower()) or "unknown"
+
+        # Topic: first 3 word-like tokens from the reacted message text.
+        text = bundle.get("reacted_message_text") or ""
+        # Strip Slack markup (user mentions, channel mentions, links).
+        text = re.sub(r"<[^>]+>", " ", text)
+        words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+        # Skip very short / stopword-y tokens.
+        stop = {"the", "a", "an", "of", "to", "and", "or", "is", "in", "on",
+                "for", "with", "at", "by", "from", "as", "it", "be", "do",
+                "i", "you", "we", "they", "he", "she"}
+        topic_words = [w for w in words if w not in stop and len(w) >= 2][:3]
+        if not topic_words:
+            topic_words = ["capture"]
+        topic_slug = "-".join(topic_words)
+
+        return f"{date_str}-{last_name_slug}-{topic_slug}"
+
+    @staticmethod
+    def _build_frontmatter(bundle: dict) -> str:
+        """Build the YAML frontmatter block for a capture file.
+
+        Deterministic. Mirrors the contract previously baked into the
+        opencode prompt.
+        """
+        # Trim reacted message to 200 chars and escape for safe YAML quoting.
+        # Strategy: replace " with ' so the outer "..." quoting stays valid,
+        # collapse newlines to spaces.
+        reacted = (bundle.get("reacted_message_text") or "")[:200]
+        reacted = reacted.replace("\n", " ").replace('"', "'")
+
+        lines = [
+            "---",
+            "source: slack",
+            f"workspace: {bundle.get('workspace', 'unknown')}",
+            f'channel: "{bundle.get("channel", "")}"',
+            f'author: "{bundle.get("author", "")}"',
+            f"participants: {json.dumps(bundle.get('participants', []))}",
+            f"permalink: {bundle.get('permalink', '')}",
+            f"message_date: {bundle.get('message_date', '')}",
+            f'reacted_message: "{reacted}"',
+            f"captured_at: {bundle.get('captured_at', '')}",
+            f'slack_ts: "{bundle.get("slack_ts", "")}"',
+            "tags: []",
+            "---",
+        ]
+        return "\n".join(lines)
 
     def _park_pending(self, event: dict, error: str):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -620,6 +807,93 @@ class HarvestHandler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
+# Startup self-test (ISSUES.md #9a)
+# ---------------------------------------------------------------------------
+
+
+def _dm_self(client: SlackClient, text: str) -> bool:
+    """DM the authenticated user. Used for startup-failure alerts.
+
+    Returns True on success, False on any failure. Errors are swallowed —
+    this is a best-effort alert path, not a critical-path operation.
+    """
+    try:
+        auth = client.get_authed_user()
+        user_id = auth.get("user_id")
+        if not user_id:
+            return False
+        dm = client._call("conversations.open", {"users": user_id})
+        channel = dm.get("channel", {}).get("id")
+        if not channel:
+            return False
+        client._call("chat.postMessage", {"channel": channel, "text": text})
+        return True
+    except Exception as e:
+        log.warning("Self-DM failed (alert lost): %s", e)
+        return False
+
+
+def startup_self_test(client: SlackClient, opencode_cmd: str) -> list[str]:
+    """Verify Slack auth and opencode invocation work post-boot.
+
+    Returns a list of failure messages (empty list = healthy).
+    See ISSUES.md #9a.
+    """
+    failures: list[str] = []
+
+    # Test 1: Slack auth.test
+    try:
+        auth = client.get_authed_user()
+        log.info("Self-test: Slack auth OK (user=%s, user_id=%s)",
+                 auth.get("user"), auth.get("user_id"))
+    except Exception as e:
+        msg = f"Slack auth.test failed: {e}"
+        log.error("Self-test: %s", msg)
+        failures.append(msg)
+
+    # Test 2: opencode stdout round-trip.
+    # The harvester only uses opencode to generate body text (stdout-only,
+    # no filesystem access). The probe matches that contract: ask for a
+    # single token on stdout, verify it appears.
+    try:
+        result = subprocess.run(
+            [opencode_cmd, "run",
+             "Reply with the single word PONG and nothing else. "
+             "Do not invoke any tools. Do not write to any files."],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        stdout = (result.stdout or "").strip()
+        if result.returncode != 0:
+            msg = (f"opencode probe rc={result.returncode}: "
+                   f"{(result.stderr or '').strip()[:200]}")
+            log.error("Self-test: %s", msg)
+            failures.append(msg)
+        elif "PONG" not in stdout.upper():
+            msg = (f"opencode probe rc=0 but PONG not in stdout. "
+                   f"got: {stdout[:200]!r}")
+            log.error("Self-test: %s", msg)
+            failures.append(msg)
+        else:
+            log.info("Self-test: opencode stdout probe OK")
+    except subprocess.TimeoutExpired:
+        msg = "opencode probe timed out after 120s"
+        log.error("Self-test: %s", msg)
+        failures.append(msg)
+    except FileNotFoundError as e:
+        msg = f"opencode binary not found: {e}"
+        log.error("Self-test: %s", msg)
+        failures.append(msg)
+    except Exception as e:
+        msg = f"opencode probe raised: {e}"
+        log.error("Self-test: %s", msg)
+        failures.append(msg)
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -652,6 +926,7 @@ def main():
         sys.exit(1)
 
     capture_dir = cfg["capture_dir"]
+    state_dir = Path(cfg["state_dir"]).expanduser().resolve() if cfg.get("state_dir") else None
     interval = cfg["poll_interval"]
     reactions = cfg["reactions"]
     opencode_cmd = cfg.get("opencode_command", "opencode")
@@ -659,17 +934,53 @@ def main():
 
     log.info("Vault: %s", vault)
     log.info("Capture dir: %s/%s", vault, capture_dir)
+    log.info("State dir: %s", state_dir or f"{vault}/{capture_dir}/_state")
     log.info("Chrome profile: %s", chrome_profile)
     log.info("Poll interval: %ds", interval)
     log.info("Trigger reactions: %s", ", ".join(f":{r}:" for r in reactions))
 
-    state = HarvesterState(vault, capture_dir, chrome_profile)
+    state = HarvesterState(vault, capture_dir, chrome_profile, state_dir=state_dir)
     client = SlackClient(state)
     worker = CaptureWorker(state, client, opencode_cmd)
     poller = ReactionPoller(state, client, worker, interval, reactions)
 
     HarvestHandler.state = state
     HarvestHandler.worker = worker
+
+    # Recovery sweep (ISSUES.md #10): un-mark seen entries with no corresponding
+    # .md file in the expected dated dir. Catches silent losses from before
+    # ISSUES.md #1's verification landed. Runs every startup; cheap (only scans
+    # seen.json entries from the last 30 days).
+    if state.has_credentials():
+        try:
+            recovered = state.recovery_sweep(max_age_days=30)
+            if recovered:
+                log.info("Recovery sweep: un-marked %d historical orphan(s); "
+                         "will retry on next poll", recovered)
+            else:
+                log.info("Recovery sweep: no orphans found")
+        except Exception as e:
+            log.error("Recovery sweep failed: %s", e, exc_info=True)
+    else:
+        log.warning("Recovery sweep skipped: no credentials at startup")
+
+    # Self-test (ISSUES.md #9a): verify Slack auth + opencode round-trip work
+    # post-boot. If either fails, DM Matt immediately rather than waiting for
+    # the 5-min healthcheck cycle to notice. Doesn't block startup — harvester
+    # continues even if self-test fails, so a partial outage (e.g. opencode
+    # broken but Slack auth fine) doesn't prevent the sink from at least
+    # parking captures to _pending/.
+    if state.has_credentials():
+        failures = startup_self_test(client, opencode_cmd)
+        if failures:
+            alert = (":rotating_light: *Slack Harvester startup self-test failed*\n\n"
+                     + "\n".join(f"\u2022 {f}" for f in failures)
+                     + "\n\nLog: `tail -100 /private/tmp/harvester.log`")
+            _dm_self(client, alert)
+        else:
+            log.info("Startup self-test: all checks passed")
+    else:
+        log.warning("Self-test skipped: no credentials at startup")
 
     poller.start()
     log.info("Poller started")
