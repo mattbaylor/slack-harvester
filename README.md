@@ -14,12 +14,19 @@ Slack (any client)
        ├─ finds new reactions via search.messages
        ├─ fetches thread or channel context
        ├─ resolves user/channel names
+       ├─ enumerates attached files (files[] + blocks[].image)
        │
        ▼
-  opencode (AI writes the Markdown)
+  Python downloads attached files → folder/01.png, 02.pdf, …
        │
        ▼
-  vault/{capture_dir}/2026-05-26/2026-05-26-rossi-deploy-rollback.md
+  opencode (AI writes the Markdown body; informed of asset list)
+       │
+       ▼
+   vault/{capture_dir}/2026-05-26/2026-05-26-rossi-deploy-rollback/
+       ├─ capture.md
+       ├─ 01.png         (attached image, if any)
+       └─ 02.pdf         (attached PDF, if any)
 ```
 
 Credentials are read directly from a Chrome profile on disk — no running browser, no extension, no Slack app install required. You sign into Slack in a dedicated Chrome profile once, and the harvester reads the session token and cookie from Chrome's local storage and cookie database.
@@ -160,17 +167,26 @@ Copy `config.example.json` to `config.json` and edit (or let `setup.sh` do it):
 
 ## Output
 
-Each capture produces a Markdown file:
+Each capture produces a folder containing `capture.md` plus any attached files:
 
 ```
 slack-captures/
   2026-05-26/
-    2026-05-26-rossi-deploy-rollback.md
-  _pending/           # raw JSON for failed captures
-  _state/
-    seen.json         # dedup ledger
-    users-cache.json
-    channels-cache.json
+    2026-05-26-rossi-deploy-rollback/
+      capture.md
+      01.png                       # attached image, if any
+      02.pdf                       # attached PDF, if any
+      _pending-images.json         # only present if some assets failed to download
+  _pending/                        # raw JSON for capture-level (not asset-level) failures
+```
+
+State is no longer kept inside the vault. The dedup ledger and name caches live at:
+
+```
+~/.local/state/slack-harvester/
+  seen.json
+  users-cache.json
+  channels-cache.json
 ```
 
 ### Frontmatter
@@ -188,10 +204,39 @@ reacted_message: "Rolled back the prod deploy. Root cause was..."
 captured_at: 2026-05-26T14:04:18+00:00
 slack_ts: "1716732202.001900"
 tags: []
+assets:                  # OPTIONAL — present only when ≥1 file downloaded
+  - {"filename": "01.png", "mimetype": "image/png", "original_name": "screenshot.png", "size_bytes": 138292}
+pending_assets:          # OPTIONAL — present only when ≥1 file failed to download
+  - {"filename": "02.mp4", "mimetype": "video/mp4", "original_name": "demo.mp4", "reason": "File too large"}
 ---
 ```
 
-The body is AI-generated from the message context: a summary, key decisions, action items, wiki-linked participant names, and preserved code blocks or links.
+The body is AI-generated from the message context: a summary, key decisions, action items, wiki-linked participant names, preserved code blocks or links, and inline asset embeds. A mechanical `## Files` appendix is appended at the bottom for any capture with assets (defensive — guarantees discoverability even if the model omits inline embeds).
+
+## Attached files
+
+The harvester downloads all attached files (images, PDFs, video, audio, zip — anything in Slack `files[]` or `blocks[].image`) into the capture folder. Skipped: link-unfurl thumbnails (OG image, favicon noise) and files larger than 100 MB.
+
+Auth uses the same `xoxc` Bearer token the Web API uses; the `d` cookie is not required for file downloads.
+
+### Partial failure — `_pending-images.json`
+
+If any asset fails to download (network blip, auth issue, size cap), the capture still ships with whatever succeeded. Failures are recorded in two places:
+
+1. `_pending-images.json` next to `capture.md` — machine-readable, contains the original URL, mimetype, intended filename, and failure reason for each item.
+2. The capture's `pending_assets:` frontmatter — same shape, easier to skim.
+3. A "Failed downloads" section in the body's `## Files` appendix with a retry hint.
+
+### Retrying failed downloads
+
+```bash
+python3 harvester.py --retry-pending           # apply
+python3 harvester.py --retry-pending --dry-run # preview
+```
+
+Walks every `_pending-images.json` under the capture root and retries each item. On success, the bytes land at the originally-intended filename (`01.png`, etc.), the item is removed from `_pending-images.json`, and the capture's `assets:` frontmatter is updated. When `_pending-images.json` becomes empty, it's deleted.
+
+Idempotent — running it with no pending files exits cleanly. Exits rc=2 if Slack credentials are missing.
 
 ## How credentials work
 
@@ -204,7 +249,8 @@ The harvester reads Slack's `xoxc` session token from Chrome's `localStorage` Le
 
 ## Failure handling
 
-- Failed captures are parked as raw JSON in `_pending/`. Fix the issue (usually expired credentials), then remove the entry from `_state/seen.json` and let the next poll retry.
+- **Capture-level failures** (opencode error, network drop mid-fetch, etc.) park raw JSON to `{capture_dir}/_pending/`. The dedup ledger entry is un-marked so the next poll retries automatically. Persistent failures stay parked; clean up manually after fixing the underlying issue.
+- **Asset-level failures** (one or more attached files won't download) park to `{capture_dir}/YYYY-MM-DD/{slug}/_pending-images.json`. The capture itself ships. Retry with `python3 harvester.py --retry-pending`. See "Attached files" above.
 - Slack rate limits are handled with `Retry-After` backoff.
 - Auth failures trigger an automatic credential re-read from the Chrome profile.
 

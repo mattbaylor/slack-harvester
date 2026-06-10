@@ -65,6 +65,15 @@ def load_config(config_path: Path) -> dict:
 SLACK_API = "https://slack.com/api"
 CACHE_MAX_AGE_DAYS = 7
 
+# Asset capture (folder-per-capture layout). Files attached to a Slack message
+# are downloaded into the capture folder as 01.ext, 02.ext, etc.
+ASSET_MAX_BYTES = 100 * 1024 * 1024   # 100 MB; larger files skip and park.
+ASSET_DOWNLOAD_TIMEOUT = 60            # Per-file, seconds.
+
+# MIME-prefixes that should be embedded inline in the body. Everything else
+# (PDF, video, zip, etc.) gets a plain link in the Files appendix only.
+ASSET_INLINE_MIME_PREFIXES = ("image/",)
+
 log = logging.getLogger("harvester")
 
 # ---------------------------------------------------------------------------
@@ -190,10 +199,17 @@ class HarvesterState:
                     orphans.append(key)
                     continue
 
-                # Look for any .md file referencing this slack_ts in frontmatter.
-                # Capture file names use a slug, not the ts, so we have to grep.
+                # Look for any capture file referencing this slack_ts in
+                # frontmatter. Capture file names use a slug, not the ts,
+                # so we have to grep. Two layouts to support:
+                # - Folder-per-capture (current): {date_dir}/{slug}/capture.md
+                # - Flat (historical / pre-2026-06-10): {date_dir}/{slug}.md
+                # Migration moves all historical captures to the folder
+                # layout, but during transition or for any forgotten
+                # straggler we still scan both shapes.
                 found = False
-                for md in date_dir.glob("*.md"):
+                candidates = list(date_dir.glob("*/capture.md")) + list(date_dir.glob("*.md"))
+                for md in candidates:
                     try:
                         # Cheap check: ts string appears in the first 2KB
                         # (frontmatter `slack_ts:` line).
@@ -395,6 +411,96 @@ class SlackClient:
             log.warning("Failed to resolve channel %s: %s", channel_id, e)
             return channel_id
 
+    def download_file(self, url: str, dest: Path, timeout: int = 60,
+                      max_bytes: Optional[int] = None) -> int:
+        """Download a Slack-hosted file (url_private or similar) to dest.
+
+        Auth model: Slack file CDN accepts the same xoxc Bearer token used for
+        Web API calls. The d cookie is not required for file downloads (it's
+        a different code path on Slack's side). Confirmed against
+        files.slack.com hosts.
+
+        Args:
+            url: Slack file URL (typically url_private from files[]).
+            dest: Destination path. Parent directory must exist.
+            timeout: Per-request timeout in seconds.
+            max_bytes: Optional size cap. If the response Content-Length
+                       exceeds this, the download is aborted before writing.
+                       If Content-Length is missing, streams up to max_bytes
+                       and aborts if exceeded.
+
+        Returns:
+            Bytes written.
+
+        Raises:
+            RuntimeError on auth failure (4xx) or transport failure.
+            RuntimeError if max_bytes exceeded.
+        """
+        if not self.state.token:
+            raise RuntimeError("No credentials for file download")
+
+        req = Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {self.state.token}")
+        # Cookie not needed for file downloads; deliberately omitted.
+
+        try:
+            resp = urlopen(req, timeout=timeout)
+        except Exception as e:
+            raise RuntimeError(f"Download failed (transport): {e}")
+
+        # Pre-flight size check from Content-Length when available.
+        cl = resp.headers.get("Content-Length")
+        if cl is not None and max_bytes is not None:
+            try:
+                if int(cl) > max_bytes:
+                    raise RuntimeError(
+                        f"File too large: Content-Length {cl} > max_bytes {max_bytes}"
+                    )
+            except ValueError:
+                pass  # Bad header, fall through to streamed cap
+
+        # Stream to disk with a streaming cap as a backstop.
+        bytes_written = 0
+        chunk = 64 * 1024
+        try:
+            with open(dest, "wb") as f:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    bytes_written += len(buf)
+                    if max_bytes is not None and bytes_written > max_bytes:
+                        # Abort and unlink the partial file.
+                        f.close()
+                        try:
+                            dest.unlink()
+                        except OSError:
+                            pass
+                        raise RuntimeError(
+                            f"File too large: exceeded max_bytes {max_bytes} mid-stream"
+                        )
+                    f.write(buf)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # Clean up partial file on any other error.
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(f"Download failed (write): {e}")
+
+        if bytes_written == 0:
+            # Slack returns HTML login page on auth failure with 200 OK
+            # for some URL shapes. Empty body is also suspicious.
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise RuntimeError("Download produced empty file (auth or URL issue?)")
+
+        return bytes_written
+
 
 # ---------------------------------------------------------------------------
 # Poller — checks reactions.list periodically
@@ -474,7 +580,8 @@ class ReactionPoller:
         if new_count:
             log.info("Enqueued %d new capture(s)", new_count)
         else:
-            log.debug("Poll: no new :cap: reactions (%d total matches)", len(matches))
+            log.debug("Poll: no new trigger reactions (%d total matches across %d reaction(s))",
+                      len(matches), len(self.reactions))
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +666,14 @@ class CaptureWorker:
         msg_date = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
         reacted_text = msg.get("text", "")
 
-        # Step 8: Build the bundle for opencode
+        # Step 8: Enumerate asset candidates from the message stream.
+        # files[] is the primary source. blocks[].image blocks also count
+        # (pasted images in rich-text). attachments[].image_url is skipped
+        # deliberately — those are link-unfurl thumbnails (OG image, favicon),
+        # noise that doesn't belong in the capture.
+        asset_candidates = self._enumerate_assets(messages)
+
+        # Step 9: Build the bundle for opencode body generation.
         bundle = {
             "channel": channel_name,
             "channel_id": channel,
@@ -600,53 +714,354 @@ class CaptureWorker:
             ],
         }
 
-        # Step 9: Invoke opencode
-        self._invoke_opencode(bundle)
+        # Step 10: Write capture folder + assets + capture.md.
+        self._invoke_opencode(bundle, asset_candidates)
 
-    def _invoke_opencode(self, bundle: dict):
-        """Generate markdown body via opencode (stdout-only), write file in Python.
+    @staticmethod
+    def _enumerate_assets(messages: list[dict]) -> list[dict]:
+        """Walk the message stream, return asset candidates in order.
 
-        Splitting the responsibilities:
-        - opencode: turns the Slack bundle into curated markdown body text.
-          Stdout-only; no filesystem access required.
-        - Python: computes the slug, builds frontmatter, writes the file,
-          verifies it landed on disk.
+        Each candidate is a dict with: url, original_name, mimetype, size_hint.
+        Order is message order (oldest first), then file order within each
+        message. The serialization index (01, 02, …) is assigned later in
+        _fetch_assets to keep this side-effect free.
 
-        This eliminates the silent-failure class where opencode returns rc=0
-        but never invokes a Write tool (ISSUES.md #1). Also reduces blast
-        radius (#5) — opencode has no path to write outside our control.
+        Sources collected:
+        - files[] entries with a url_private (any mimetype — image, PDF,
+          video, zip, audio, etc.).
+        - blocks[].image blocks (pasted-into-rich-text images).
+
+        Sources deliberately skipped:
+        - attachments[].image_url — link-unfurl thumbnails (OG image,
+          favicon noise).
+        - files[] entries without url_private (rare; tombstoned uploads).
+        """
+        candidates: list[dict] = []
+        seen_urls: set[str] = set()  # Per-capture dedup; same file referenced twice → fetch once.
+
+        for m in messages:
+            # files[]
+            for f in (m.get("files") or []):
+                url = f.get("url_private")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                candidates.append({
+                    "url": url,
+                    "original_name": f.get("name") or "",
+                    "mimetype": f.get("mimetype") or "",
+                    "size_hint": f.get("size"),  # Slack reports size in files.info, often present in files[] too.
+                    "permalink": f.get("permalink") or "",
+                })
+
+            # blocks[].image
+            for block in (m.get("blocks") or []):
+                if block.get("type") != "image":
+                    continue
+                url = block.get("image_url") or block.get("slack_file", {}).get("url")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                candidates.append({
+                    "url": url,
+                    "original_name": block.get("alt_text") or "",
+                    "mimetype": "image/unknown",  # blocks don't carry mimetype reliably
+                    "size_hint": None,
+                    "permalink": "",
+                })
+
+        return candidates
+
+    def _fetch_assets(self, candidates: list[dict], dest_dir: Path) -> tuple[list[dict], list[dict]]:
+        """Download asset candidates into dest_dir as 01.ext, 02.ext, ….
+
+        Returns (succeeded, failed):
+        - succeeded: list of dicts with index, filename, mimetype, original_name, size_bytes, url
+        - failed:    list of dicts with index, original_name, url, reason
+
+        Per ASSET_MAX_BYTES, large files are skipped with a recorded reason
+        (not raised). Per the plan's failure mode: partial success — the
+        capture lands with whatever fetched; failures are surfaced via
+        _pending-images.json by the caller.
+        """
+        succeeded: list[dict] = []
+        failed: list[dict] = []
+
+        if not candidates:
+            return succeeded, failed
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, cand in enumerate(candidates, start=1):
+            ext = self._infer_extension(cand)
+            filename = f"{i:02d}{ext}"
+            dest = dest_dir / filename
+
+            try:
+                size = self.client.download_file(
+                    cand["url"], dest,
+                    timeout=ASSET_DOWNLOAD_TIMEOUT,
+                    max_bytes=ASSET_MAX_BYTES,
+                )
+                log.info("  asset %s ← %s (%d bytes, %s)",
+                         filename, cand.get("original_name") or "<unnamed>", size,
+                         cand.get("mimetype") or "?")
+                succeeded.append({
+                    "index": i,
+                    "filename": filename,
+                    "mimetype": cand.get("mimetype") or "",
+                    "original_name": cand.get("original_name") or "",
+                    "size_bytes": size,
+                    "url": cand["url"],
+                    "permalink": cand.get("permalink") or "",
+                })
+            except RuntimeError as e:
+                reason = str(e)
+                log.warning("  asset %s FAILED: %s — %s",
+                            filename, cand.get("original_name") or "<unnamed>", reason)
+                failed.append({
+                    "index": i,
+                    "filename": filename,
+                    "original_name": cand.get("original_name") or "",
+                    "mimetype": cand.get("mimetype") or "",
+                    "url": cand["url"],
+                    "permalink": cand.get("permalink") or "",
+                    "reason": reason,
+                })
+
+        return succeeded, failed
+
+    @staticmethod
+    def _infer_extension(cand: dict) -> str:
+        """Infer a sensible file extension from a candidate's metadata.
+
+        Priority: original filename extension > mimetype mapping > .bin fallback.
+        Always returns a leading dot, e.g. ".png" or ".bin".
+        """
+        import os as _os
+
+        name = cand.get("original_name") or ""
+        if name:
+            _, dot_ext = _os.path.splitext(name)
+            if dot_ext and len(dot_ext) <= 8 and dot_ext.startswith("."):
+                # Normalize to lowercase ASCII.
+                ext_clean = "".join(c for c in dot_ext.lower() if c.isalnum() or c == ".")
+                if ext_clean and ext_clean.startswith("."):
+                    return ext_clean
+
+        mime = (cand.get("mimetype") or "").lower()
+        mime_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/svg+xml": ".svg",
+            "image/heic": ".heic",
+            "image/heif": ".heif",
+            "application/pdf": ".pdf",
+            "application/zip": ".zip",
+            "video/mp4": ".mp4",
+            "video/quicktime": ".mov",
+            "video/webm": ".webm",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+            "audio/wav": ".wav",
+            "text/plain": ".txt",
+            "text/csv": ".csv",
+            "application/json": ".json",
+        }
+        if mime in mime_map:
+            return mime_map[mime]
+        # Last-resort: type/subtype → .subtype if it looks safe.
+        if "/" in mime:
+            subtype = mime.split("/", 1)[1]
+            subtype = "".join(c for c in subtype if c.isalnum())
+            if 1 <= len(subtype) <= 8:
+                return f".{subtype}"
+        return ".bin"
+
+    def _invoke_opencode(self, bundle: dict, asset_candidates: list[dict]):
+        """Materialize a capture: folder + assets + capture.md.
+
+        Layout (folder-per-capture, 2026-06-10):
+
+            {vault}/{capture_dir}/YYYY-MM-DD/{slug}/
+                capture.md
+                01.ext              ← asset 1
+                02.ext              ← asset 2
+                _pending-images.json  ← only on partial download failure
+
+        Responsibilities:
+        - Python: slug, folder creation, asset download, frontmatter,
+                  appendix, file write, verification.
+        - opencode: body text only (stdout-only; no filesystem access).
+
+        The stdout-only opencode contract from ISSUES.md #1/#5 is preserved.
+        Adding assets does NOT give opencode any path to write to the
+        filesystem — Python remains the sole writer.
         """
         cap_dir = self.state.capture_dir
         msg_ts = float(bundle["slack_ts"])
         date_str = datetime.fromtimestamp(msg_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        out_dir = self.state.vault / cap_dir / date_str
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        body = self._generate_body_via_opencode(bundle)
+        date_dir = self.state.vault / cap_dir / date_str
         slug = self._build_slug(bundle, date_str)
-        frontmatter = self._build_frontmatter(bundle)
 
-        out_path = out_dir / f"{slug}.md"
-        # Guard against slug collisions (same author + same 3-word topic on
-        # the same day). Append a suffix derived from the slack ts.
-        if out_path.exists():
+        # Folder-collision guard. Same author + same 3-word topic on the
+        # same day → suffix folder name with last 6 of slack ts.
+        #
+        # A folder existing without `capture.md` is NOT a real collision —
+        # it's a half-built attempt from a previous failure (e.g. opencode
+        # error after assets downloaded). In that case we re-use the folder
+        # and let the asset re-download (or the cleanup-then-rebuild flow)
+        # complete it. Only when an actual successful prior capture lives
+        # in `{slug}/capture.md` do we suffix to avoid clobbering it.
+        capture_dir_path = date_dir / slug
+        if capture_dir_path.exists() and (capture_dir_path / "capture.md").exists():
             suffix = bundle["slack_ts"].replace(".", "")[-6:]
-            out_path = out_dir / f"{slug}-{suffix}.md"
+            capture_dir_path = date_dir / f"{slug}-{suffix}"
+        # Track whether we created this folder so the failure path can
+        # clean it up without nuking unrelated content.
+        folder_was_new = not capture_dir_path.exists()
+        capture_dir_path.mkdir(parents=True, exist_ok=True)
 
-        out_path.write_text(frontmatter + "\n" + body.strip() + "\n")
-        if not out_path.exists() or out_path.stat().st_size == 0:
-            raise RuntimeError(f"Wrote {out_path} but file is missing or empty")
+        try:
+            # Asset download FIRST so the body generation can be informed
+            # about what assets exist (filename, mimetype) and embed them.
+            # On partial failure: succeeded list lands in the folder; failed
+            # list is parked as _pending-images.json (capture still ships).
+            succeeded, failed = self._fetch_assets(asset_candidates, capture_dir_path)
 
-        log.info("Capture written: %s (%d bytes)",
-                 out_path.relative_to(self.state.vault), out_path.stat().st_size)
+            if failed:
+                pending_path = capture_dir_path / "_pending-images.json"
+                pending_payload = {
+                    "capture_slug": capture_dir_path.name,
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "items": failed,
+                }
+                pending_path.write_text(json.dumps(pending_payload, indent=2) + "\n")
+                log.warning("Parked %d asset(s) as %s",
+                            len(failed),
+                            pending_path.relative_to(self.state.vault))
 
-    def _generate_body_via_opencode(self, bundle: dict) -> str:
+            # Generate the body. Pass succeeded assets so the prompt can
+            # instruct embeds at the right anchor (per-message? per-thread?).
+            body = self._generate_body_via_opencode(bundle, succeeded)
+
+            # Mechanically append a Files appendix from the succeeded list
+            # (plus failed entries, marked). Defensive — even if the model
+            # forgets the inline embeds, the appendix guarantees discoverability.
+            appendix = self._build_appendix(succeeded, failed)
+
+            frontmatter = self._build_frontmatter(bundle, succeeded, failed)
+
+            out_path = capture_dir_path / "capture.md"
+
+            composed = frontmatter + "\n" + body.strip()
+            if appendix:
+                composed += "\n\n" + appendix
+            composed += "\n"
+
+            out_path.write_text(composed)
+            if not out_path.exists() or out_path.stat().st_size == 0:
+                raise RuntimeError(f"Wrote {out_path} but file is missing or empty")
+
+            log.info("Capture written: %s (%d bytes, %d assets%s)",
+                     out_path.relative_to(self.state.vault),
+                     out_path.stat().st_size,
+                     len(succeeded),
+                     f", {len(failed)} failed → pending" if failed else "")
+
+        except Exception:
+            # Failure cleanup: if `capture.md` didn't land, we don't want
+            # to leave a half-built folder behind. It pollutes the date
+            # dir and causes the next retry to either re-use a stale state
+            # or pick a suffixed name (sprawl). Two cases:
+            #   - folder_was_new: we created it; safe to remove the whole
+            #     subtree (it's all ours).
+            #   - else: folder pre-existed (rare, from a prior aborted
+            #     attempt that wasn't cleaned). Remove only the artifacts
+            #     we just added (downloaded assets + _pending-images.json),
+            #     leave anything we didn't touch untouched.
+            try:
+                if (capture_dir_path / "capture.md").exists():
+                    pass  # capture.md landed; failure is post-write; keep folder.
+                elif folder_was_new:
+                    import shutil as _shutil
+                    _shutil.rmtree(capture_dir_path, ignore_errors=True)
+                    log.info("Cleaned up half-built folder %s",
+                             capture_dir_path.name)
+                else:
+                    # Conservative cleanup: remove our known artifacts.
+                    for child in capture_dir_path.iterdir():
+                        if child.name == "_pending-images.json":
+                            child.unlink(missing_ok=True)
+                        elif child.is_file() and child.suffix and child.stem.isdigit():
+                            # NN.ext shape — our naming convention.
+                            child.unlink(missing_ok=True)
+                    log.info("Cleaned up our artifacts in pre-existing folder %s",
+                             capture_dir_path.name)
+            except Exception as cleanup_err:
+                log.warning("Cleanup after failure also failed: %s", cleanup_err)
+            raise
+
+    def _generate_body_via_opencode(self, bundle: dict,
+                                    assets: list[dict]) -> str:
         """Run opencode to turn the bundle into curated markdown body text.
 
         Returns the body string. Raises RuntimeError on any failure mode
         (non-zero rc, timeout, empty stdout).
+
+        Asset-awareness: when assets are present, the prompt is augmented
+        with a list of their relative paths + metadata, and opencode is
+        instructed to embed images inline (`![alt](NN.ext)`) and link
+        non-images (`[name](NN.ext)`). The Files appendix at the bottom
+        is mechanically appended by Python afterwards regardless, so
+        flaky embed compliance doesn't lose information.
         """
-        bundle_json = json.dumps(bundle, indent=2)
+        # Augment the bundle for the prompt with the asset list so the
+        # model knows what's available, what filenames to use, and what
+        # mimetypes they are. We do NOT modify the input `bundle` dict
+        # so frontmatter generation sees the canonical shape.
+        prompt_bundle = dict(bundle)
+        prompt_bundle["_local_assets"] = [
+            {
+                "filename": a["filename"],
+                "mimetype": a["mimetype"],
+                "original_name": a["original_name"],
+                "is_image": (a.get("mimetype") or "").lower().startswith(ASSET_INLINE_MIME_PREFIXES),
+            }
+            for a in assets
+        ]
+        bundle_json = json.dumps(prompt_bundle, indent=2)
+
+        if assets:
+            asset_instructions = """
+
+## Assets
+
+Local assets have been downloaded into the same folder as the capture file.
+For each entry in `_local_assets`:
+- If `is_image` is true → embed inline at the point in the body where the
+  message that contained it would naturally appear, using `![alt](FILENAME)`
+  with a short descriptive alt-text (use `original_name` if helpful, else
+  describe the message context). Use the literal `filename` field as the
+  path — do NOT add a `./` prefix; do NOT add a folder.
+- If `is_image` is false → link inline with `[original_name or "Attachment"](FILENAME)`.
+
+Do not mention "see Files appendix" or any reference to a list at the
+bottom — a Files appendix is appended mechanically after your body, so
+inline embeds should focus on contextual presentation only.
+
+If you cannot determine where an asset belongs in the body, embed it
+once at the most logical position (e.g. right after the reacted message).
+Do not omit any asset from the body — every entry in `_local_assets`
+must appear at least once, inline.
+"""
+        else:
+            asset_instructions = ""
+
         prompt = f"""You are processing a captured Slack message. Return ONLY the markdown body text. No frontmatter. No preamble. No "Here is the markdown" wrapper. No code fence around the whole output. Just the body content, ready to be appended to a markdown file.
 
 ## Input data (JSON)
@@ -664,7 +1079,7 @@ class CaptureWorker:
 - Filter out noise (reactions-only messages, "thanks", join/leave, etc.).
 - For references to people, use `[[Display Name]]` wiki-links.
 - Preserve code blocks, links, and structured data inside the body.
-
+{asset_instructions}
 Return only the markdown body. Do not invoke any tools. Do not write to any files. Do not output anything other than the body text.
 """
         try:
@@ -700,6 +1115,48 @@ Return only the markdown body. Do not invoke any tools. Do not write to any file
         return body
 
     @staticmethod
+    def _build_appendix(succeeded: list[dict], failed: list[dict]) -> str:
+        """Build a mechanical 'Files' appendix listing all assets.
+
+        Succeeded entries appear as plain markdown links; failed entries
+        appear under a sub-heading with their reason, so the human reading
+        the capture immediately sees what couldn't be fetched and can run
+        `harvester.py --retry-pending` to attempt re-download.
+        """
+        if not succeeded and not failed:
+            return ""
+
+        lines = ["## Files"]
+
+        if succeeded:
+            for a in succeeded:
+                name = a.get("original_name") or a["filename"]
+                # Escape pipe in name to avoid breaking nested tables (rare).
+                name = name.replace("\n", " ").strip() or a["filename"]
+                size_kb = max(1, a.get("size_bytes", 0) // 1024)
+                mime = a.get("mimetype") or ""
+                lines.append(
+                    f"- [{name}]({a['filename']}) — {mime or 'unknown'}, ~{size_kb} KB"
+                )
+
+        if failed:
+            lines.append("")
+            lines.append("### Failed downloads (parked to `_pending-images.json`)")
+            for f in failed:
+                name = f.get("original_name") or f["filename"]
+                name = name.replace("\n", " ").strip() or f["filename"]
+                reason = (f.get("reason") or "unknown").replace("\n", " ")[:160]
+                permalink = f.get("permalink") or f.get("url") or ""
+                if permalink:
+                    lines.append(f"- **{name}** ({f['filename']}) — {reason} · [Slack]({permalink})")
+                else:
+                    lines.append(f"- **{name}** ({f['filename']}) — {reason}")
+            lines.append("")
+            lines.append("Retry with: `python ~/repo/slack-harvester/harvester.py --retry-pending`")
+
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_slug(bundle: dict, date_str: str) -> str:
         """Build a filename slug: `{date}-{author-last-name}-{3-word-topic}`.
 
@@ -732,11 +1189,19 @@ Return only the markdown body. Do not invoke any tools. Do not write to any file
         return f"{date_str}-{last_name_slug}-{topic_slug}"
 
     @staticmethod
-    def _build_frontmatter(bundle: dict) -> str:
+    def _build_frontmatter(bundle: dict,
+                           succeeded_assets: Optional[list[dict]] = None,
+                           failed_assets: Optional[list[dict]] = None) -> str:
         """Build the YAML frontmatter block for a capture file.
 
         Deterministic. Mirrors the contract previously baked into the
         opencode prompt.
+
+        Folder-layout addition (2026-06-10): emits an `assets:` field
+        listing every successfully downloaded asset (filename + mimetype)
+        and an optional `pending_assets:` field if any failed. Both are
+        omitted entirely when there are no assets (no empty `assets: []`
+        on historical-shape captures from before this change).
         """
         # Trim reacted message to 200 chars and escape for safe YAML quoting.
         # Strategy: replace " with ' so the outer "..." quoting stays valid,
@@ -757,8 +1222,24 @@ Return only the markdown body. Do not invoke any tools. Do not write to any file
             f"captured_at: {bundle.get('captured_at', '')}",
             f'slack_ts: "{bundle.get("slack_ts", "")}"',
             "tags: []",
-            "---",
         ]
+
+        if succeeded_assets:
+            lines.append("assets:")
+            for a in succeeded_assets:
+                # JSON-encode the compact dict for safe YAML embedding.
+                lines.append(
+                    f"  - {json.dumps({'filename': a['filename'], 'mimetype': a.get('mimetype', ''), 'original_name': a.get('original_name', ''), 'size_bytes': a.get('size_bytes', 0)}, separators=(', ', ': '))}"
+                )
+
+        if failed_assets:
+            lines.append("pending_assets:")
+            for f in failed_assets:
+                lines.append(
+                    f"  - {json.dumps({'filename': f['filename'], 'mimetype': f.get('mimetype', ''), 'original_name': f.get('original_name', ''), 'reason': f.get('reason', 'unknown')[:160]}, separators=(', ', ': '))}"
+                )
+
+        lines.append("---")
         return "\n".join(lines)
 
     def _park_pending(self, event: dict, error: str):
@@ -894,6 +1375,278 @@ def startup_self_test(client: SlackClient, opencode_cmd: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Pending-image retry (orphan cleanup CLI)
+# ---------------------------------------------------------------------------
+
+
+def run_retry_pending(state: HarvesterState, client: SlackClient,
+                      dry_run: bool = False) -> dict:
+    """Walk every capture folder, find `_pending-images.json`, attempt re-download.
+
+    On success per item:
+      - Move the bytes into the capture folder at the originally-recorded
+        filename (NN.ext) so the body's inline embed (if any) resolves.
+      - Remove the item from `_pending-images.json`.
+      - When `_pending-images.json` is empty (no items left), delete it
+        and update the capture's frontmatter to drop `pending_assets:` and
+        add the now-succeeded assets to `assets:` if not already present.
+
+    On failure per item:
+      - Update the item's `reason` to the latest error and leave it in
+        `_pending-images.json`. Caller can re-run later.
+
+    Args:
+        state: HarvesterState (provides vault path, credentials).
+        client: SlackClient (provides download_file).
+        dry_run: When true, log what would happen but don't modify files.
+
+    Returns:
+        Summary dict: {"folders_scanned": N, "items_found": N, "items_succeeded": N,
+                       "items_failed": N, "folders_cleared": N}
+    """
+    summary = {
+        "folders_scanned": 0,
+        "items_found": 0,
+        "items_succeeded": 0,
+        "items_failed": 0,
+        "folders_cleared": 0,
+    }
+
+    if not client.state.has_credentials():
+        log.error("--retry-pending: no Slack credentials available")
+        return summary
+
+    capture_root = state.vault / state.capture_dir
+    if not capture_root.exists():
+        log.error("--retry-pending: capture root %s does not exist", capture_root)
+        return summary
+
+    # Find every _pending-images.json across all date dirs.
+    pending_files = list(capture_root.glob("*/*/_pending-images.json"))
+    if not pending_files:
+        log.info("--retry-pending: no pending-image files found")
+        return summary
+
+    log.info("--retry-pending: scanning %d pending-image file(s)%s",
+             len(pending_files), " (dry-run)" if dry_run else "")
+
+    for pending_path in sorted(pending_files):
+        summary["folders_scanned"] += 1
+        capture_folder = pending_path.parent
+        rel = capture_folder.relative_to(state.vault)
+
+        try:
+            payload = json.loads(pending_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            log.error("  %s: unreadable (%s); skipping", rel, e)
+            continue
+
+        items = payload.get("items") or []
+        if not items:
+            log.info("  %s: empty pending file; removing", rel)
+            if not dry_run:
+                try:
+                    pending_path.unlink()
+                    summary["folders_cleared"] += 1
+                except OSError as e:
+                    log.warning("    unlink failed: %s", e)
+            continue
+
+        log.info("  %s: %d pending item(s)", rel, len(items))
+        still_failed: list[dict] = []
+        newly_succeeded: list[dict] = []
+
+        for item in items:
+            summary["items_found"] += 1
+            filename = item.get("filename") or "??.bin"
+            original = item.get("original_name") or "<unnamed>"
+            url = item.get("url")
+            if not url:
+                log.warning("    %s: no url; cannot retry", filename)
+                still_failed.append(item)
+                summary["items_failed"] += 1
+                continue
+
+            dest = capture_folder / filename
+            if dry_run:
+                log.info("    [DRY-RUN] would retry %s ← %s", filename, original)
+                still_failed.append(item)  # Keep counts honest in dry-run.
+                continue
+
+            try:
+                size = client.download_file(
+                    url, dest,
+                    timeout=ASSET_DOWNLOAD_TIMEOUT,
+                    max_bytes=ASSET_MAX_BYTES,
+                )
+                log.info("    %s: succeeded (%d bytes)", filename, size)
+                newly_succeeded.append({
+                    "index": item.get("index"),
+                    "filename": filename,
+                    "mimetype": item.get("mimetype", ""),
+                    "original_name": item.get("original_name", ""),
+                    "size_bytes": size,
+                    "url": url,
+                    "permalink": item.get("permalink", ""),
+                })
+                summary["items_succeeded"] += 1
+            except RuntimeError as e:
+                reason = str(e)
+                log.warning("    %s: still failing (%s)", filename, reason)
+                item = dict(item)
+                item["reason"] = reason
+                still_failed.append(item)
+                summary["items_failed"] += 1
+
+        if dry_run:
+            continue
+
+        if not still_failed:
+            # All recovered. Drop the pending file and update frontmatter.
+            try:
+                pending_path.unlink()
+                summary["folders_cleared"] += 1
+                log.info("  %s: all pending items recovered; removed _pending-images.json", rel)
+            except OSError as e:
+                log.warning("  %s: unlink failed (%s)", rel, e)
+            _patch_capture_frontmatter_post_retry(
+                capture_folder / "capture.md",
+                newly_succeeded=newly_succeeded,
+                still_failed=[],
+            )
+        else:
+            # Rewrite the pending file with the remaining failures only.
+            payload["items"] = still_failed
+            payload["last_retry_at"] = datetime.now(timezone.utc).isoformat()
+            pending_path.write_text(json.dumps(payload, indent=2) + "\n")
+            if newly_succeeded:
+                log.info("  %s: %d recovered, %d still failing", rel,
+                         len(newly_succeeded), len(still_failed))
+                _patch_capture_frontmatter_post_retry(
+                    capture_folder / "capture.md",
+                    newly_succeeded=newly_succeeded,
+                    still_failed=still_failed,
+                )
+
+    log.info("--retry-pending summary: scanned=%d found=%d succeeded=%d failed=%d cleared=%d",
+             summary["folders_scanned"],
+             summary["items_found"],
+             summary["items_succeeded"],
+             summary["items_failed"],
+             summary["folders_cleared"])
+    return summary
+
+
+def _patch_capture_frontmatter_post_retry(capture_md: Path,
+                                          newly_succeeded: list[dict],
+                                          still_failed: list[dict]) -> None:
+    """Best-effort frontmatter patch after a retry-pending cycle.
+
+    Adds newly-recovered entries to the `assets:` list and rewrites the
+    `pending_assets:` list to reflect the remaining failures. If the file
+    is unreadable or malformed, logs a warning and returns without raising
+    — the body file is the canonical artifact; frontmatter drift is
+    recoverable manually.
+
+    This is intentionally simple: it does a textual splice rather than a
+    full YAML round-trip, to avoid pulling in a YAML dependency.
+    """
+    if not capture_md.exists():
+        log.warning("    frontmatter patch skipped: %s missing", capture_md)
+        return
+
+    try:
+        content = capture_md.read_text()
+    except OSError as e:
+        log.warning("    frontmatter patch skipped: read failed (%s)", e)
+        return
+
+    if not content.startswith("---\n"):
+        log.warning("    frontmatter patch skipped: no frontmatter detected")
+        return
+
+    end = content.find("\n---\n", 4)
+    if end == -1:
+        log.warning("    frontmatter patch skipped: unterminated frontmatter")
+        return
+
+    fm = content[4:end]      # between the two --- markers, no leading newline
+    body = content[end + 5:]  # everything after the closing ---\n
+
+    # Split frontmatter into lines, isolate the assets/pending_assets blocks.
+    lines = fm.split("\n")
+    kept: list[str] = []
+    existing_assets: list[str] = []
+    in_assets = False
+    in_pending = False
+    for line in lines:
+        if line.startswith("assets:"):
+            in_assets = True
+            in_pending = False
+            existing_assets = []
+            continue
+        if line.startswith("pending_assets:"):
+            in_assets = False
+            in_pending = True
+            continue
+        if (in_assets or in_pending) and line.startswith("  - "):
+            if in_assets:
+                existing_assets.append(line)
+            continue
+        if (in_assets or in_pending) and not line.startswith("  "):
+            in_assets = False
+            in_pending = False
+        kept.append(line)
+
+    # Append newly-succeeded to existing_assets (avoid filename duplicates).
+    existing_filenames = set()
+    for ln in existing_assets:
+        if '"filename":' in ln:
+            try:
+                obj = json.loads(ln.lstrip("  -").strip())
+                existing_filenames.add(obj.get("filename"))
+            except json.JSONDecodeError:
+                pass
+    for a in newly_succeeded:
+        if a.get("filename") in existing_filenames:
+            continue
+        existing_assets.append(
+            "  - " + json.dumps(
+                {"filename": a["filename"],
+                 "mimetype": a.get("mimetype", ""),
+                 "original_name": a.get("original_name", ""),
+                 "size_bytes": a.get("size_bytes", 0)},
+                separators=(', ', ': ')
+            )
+        )
+
+    # Rebuild frontmatter.
+    new_fm_lines = list(kept)
+    if existing_assets:
+        new_fm_lines.append("assets:")
+        new_fm_lines.extend(existing_assets)
+    if still_failed:
+        new_fm_lines.append("pending_assets:")
+        for f in still_failed:
+            new_fm_lines.append(
+                "  - " + json.dumps(
+                    {"filename": f.get("filename", ""),
+                     "mimetype": f.get("mimetype", ""),
+                     "original_name": f.get("original_name", ""),
+                     "reason": (f.get("reason") or "unknown")[:160]},
+                    separators=(', ', ': ')
+                )
+            )
+
+    new_content = "---\n" + "\n".join(new_fm_lines).rstrip("\n") + "\n---\n" + body
+    try:
+        capture_md.write_text(new_content)
+        log.info("    frontmatter patched")
+    except OSError as e:
+        log.warning("    frontmatter patch failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -904,6 +1657,12 @@ def main():
                         default=SCRIPT_DIR / "config.json",
                         help="Path to config.json (default: alongside this script)")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--retry-pending", action="store_true",
+                        help="Walk capture folders, retry any _pending-images.json "
+                             "items, then exit. Does not start the daemon.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --retry-pending: report what would happen "
+                             "but do not download or modify files.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -941,6 +1700,18 @@ def main():
 
     state = HarvesterState(vault, capture_dir, chrome_profile, state_dir=state_dir)
     client = SlackClient(state)
+
+    # --retry-pending: one-shot orphan cleanup mode. Doesn't start the
+    # daemon, doesn't construct the worker/poller, doesn't bind the
+    # health port. Exits with rc=0 unless retry produced no failures
+    # for items that should have succeeded; rc=2 if no credentials.
+    if args.retry_pending:
+        if not state.has_credentials():
+            log.error("--retry-pending requires Slack credentials")
+            sys.exit(2)
+        run_retry_pending(state, client, dry_run=args.dry_run)
+        sys.exit(0)
+
     worker = CaptureWorker(state, client, opencode_cmd)
     poller = ReactionPoller(state, client, worker, interval, reactions)
 

@@ -6,6 +6,8 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 
 **Priority-1 PR landed 2026-06-03:** Pivoted from "opencode does the file write" to "opencode generates body text on stdout, Python writes the file." Structurally eliminates #1 and #5. Also ships: #2 (un-mark seen on failure), #9a (startup self-test, simplified to a stdout PONG probe), #10 (recovery sweep on startup).
 
+**Capture-folder layout + asset capture PR landed 2026-06-10:** Captures moved from flat `{slug}.md` to folder `{slug}/capture.md`. Attached files (images, PDFs, video, etc.) now download into the capture folder as `01.ext`, `02.ext`, …. Partial-failure parking via `_pending-images.json`; recovery via `harvester.py --retry-pending`. Frontmatter gains optional `assets:` and `pending_assets:` fields. Body gains a mechanical `## Files` appendix. Vault-wide reference rewriter (`migrate_refs.py`) and historical capture migrator (`migrate.py`) shipped alongside. Closes #8.
+
 ## Triggering incident
 
 - 2026-06-03 13:14:53 local: `:cap:` on `#team-ux-admin` ts `1780513854.323999`. Harvester logged `Capture written for #team-ux-admin/1780513854.323999` at 13:15:05. `seen.json` updated. **No file in `~/vault/51-slack-captures/2026-06-03/`.** `opencode run` returned rc=0 but never wrote.
@@ -121,10 +123,10 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 
 ## Priority 5 — cleanup
 
-### #8 — 🔴 Orphaned old-architecture state in the vault
+### #8 — 🟢 Orphaned old-architecture state in the vault (FIXED 2026-06-10)
 
-**Symptom:** `~/vault/51-slack-captures/_pending/` (21 files) and `~/vault/51-slack-captures/_state/` (3 files) are from the WebSocket-extension era. Live state moved to `/Users/matt/.local/state/slack-harvester/`. The orphans confuse future debugging — I almost mis-diagnosed today's issue by trusting the in-vault `seen.json`.
-**Fix:** Move both to `~/vault/90-archive/2026-06-slack-harvester-pre-pivot/` or delete outright. Add a note to the README that current state dir is `state_dir` in `config.json`, not in the vault.
+**Symptom:** `~/vault/51-slack-captures/_pending/` (21 files) and `~/vault/51-slack-captures/_state/` (3 files) were from the WebSocket-extension era. Live state moved to `~/.local/state/slack-harvester/`. The orphans confused future debugging.
+**Fix shipped:** Both archived to `~/vault/90-archive/2026-06-slack-harvester-pre-pivot/` as part of the 2026-06-10 capture-folder-layout migration (see `migrate.py`). The harvester continues to write capture-level failures to a live `_pending/` dir, but the dir starts empty on first run and is no longer a debugging tarpit.
 
 ---
 
@@ -133,10 +135,10 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 | Step | Issues | Status |
 |---|---|---|
 | 1 | #1, #2, #5, #9a, #10 | 🟢 Shipped 2026-06-03. Stdout-only redesign + un-mark-on-failure + recovery sweep + startup self-test. |
-| 2 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
-| 3 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
-| 4 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |
-| 5 | #8 | 🔴 Cleanup orphaned vault dirs. |
+| 2 | #8 + asset capture | 🟢 Shipped 2026-06-10. Folder-per-capture layout + asset download + migration tools. Closed orphan dirs. |
+| 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
+| 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
+| 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |
 | 6 | #4 | 🔴 Pin model. |
 | 7 | #6 | 🔴 Verify 401-path flips `has_credentials`. |
 
@@ -148,7 +150,7 @@ When silent-failure mode strikes:
 
 1. `curl -s http://127.0.0.1:7777/health | jq` — `has_credentials`, `queue_depth`, `seen_count`.
 2. `tail -F /private/tmp/harvester.log` — look for `Processing capture: …` followed by `Capture written for …` with no errors. That's the silent-failure signature.
-3. `ls -la ~/vault/51-slack-captures/$(date +%Y-%m-%d)/` — confirm presence/absence of file.
+3. `ls -la ~/vault/51-slack-captures/$(date +%Y-%m-%d)/*/capture.md` — confirm presence/absence of file.
 4. `ls -lat ~/.local/share/opencode/log/` — find the log timestamp matching the harvester's processing window. Real-home opencode logs, *not* any sandbox's `~/.local/share/opencode/log/` (different `$HOME`).
 5. `ls -lat ~/.local/share/opencode/snapshot/` and `tool-output/` — these get written when opencode actually runs tools. If they're not fresh, opencode never called a tool.
 6. Replay manually: `env -i PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME" /opt/homebrew/bin/opencode run --dir ~/vault "<copy of the prompt from harvester.py:515 with {bundle} interpolated>"` — observe stdout.
