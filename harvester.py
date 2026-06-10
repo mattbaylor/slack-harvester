@@ -224,15 +224,48 @@ class HarvesterState:
 
         return orphans
 
-    def recovery_sweep(self, max_age_days: int = 30) -> int:
-        """Find and un-mark orphaned seen entries. Returns count un-marked.
+    def recovery_sweep(self, max_age_days: int = 30,
+                       auto_unmark: bool = False) -> list[str]:
+        """Find orphaned seen entries (capture lost or never written).
 
-        See ISSUES.md #10.
+        See ISSUES.md #10 (original feature) and #11 (2026-06-10 cloud-sync
+        race; this method was changed from auto-act to report-only by default).
+
+        Behavior:
+        - Returns the list of orphan dedup keys without modifying seen.json.
+        - When auto_unmark=True, un-marks each found orphan (legacy
+          behavior; used by the explicit --recover CLI flag).
+
+        Why not auto-act at startup: the filesystem the harvester scans can
+        be cloud-synced (GoogleDrive, Dropbox), network-mounted, or
+        otherwise eventually-consistent. A startup scan after a recent
+        write may see an inconsistent view and flag real captures as
+        orphans. Auto-un-marking then causes the next poll to re-process
+        and produce duplicate folders (the 2026-06-10 incident).
+
+        The cure for genuine silent-loss recovery is to run
+        `harvester.py --recover` after manually confirming the
+        filesystem is in steady state.
         """
         orphans = self.find_orphaned_seen(max_age_days=max_age_days)
-        for key in orphans:
-            self.unmark_seen(key)
-        return len(orphans)
+
+        if orphans:
+            log.warning(
+                "Recovery sweep: found %d candidate orphan(s) in seen.json "
+                "without a matching capture file on disk. NOT auto-un-marking "
+                "(see ISSUES.md #11). To recover, after confirming the "
+                "filesystem is in steady state run: "
+                "`python harvester.py --recover`",
+                len(orphans),
+            )
+            for key in orphans:
+                log.warning("  candidate orphan: %s", key)
+
+        if auto_unmark:
+            for key in orphans:
+                self.unmark_seen(key)
+
+        return orphans
 
     def refresh_credentials(self):
         """Read credentials from Chrome profile on disk."""
@@ -1660,9 +1693,17 @@ def main():
     parser.add_argument("--retry-pending", action="store_true",
                         help="Walk capture folders, retry any _pending-images.json "
                              "items, then exit. Does not start the daemon.")
+    parser.add_argument("--recover", action="store_true",
+                        help="Run the recovery sweep (find seen.json entries "
+                             "with no matching capture file on disk and un-mark "
+                             "them so the next poll re-processes), then exit. "
+                             "Use after confirming the filesystem is in steady "
+                             "state — running this with a cloud-syncing "
+                             "filesystem mid-sync can produce duplicate captures.")
     parser.add_argument("--dry-run", action="store_true",
                         help="With --retry-pending: report what would happen "
-                             "but do not download or modify files.")
+                             "but do not download or modify files. "
+                             "With --recover: report orphans without un-marking.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1712,6 +1753,21 @@ def main():
         run_retry_pending(state, client, dry_run=args.dry_run)
         sys.exit(0)
 
+    # --recover: explicit recovery-sweep mode. Un-marks orphans found in
+    # seen.json so the next poll re-processes them. Use only after
+    # confirming the filesystem is in steady state (no in-flight cloud
+    # sync). See ISSUES.md #11.
+    if args.recover:
+        candidates = state.recovery_sweep(max_age_days=30,
+                                          auto_unmark=not args.dry_run)
+        if args.dry_run:
+            log.info("--recover --dry-run: would un-mark %d orphan(s)",
+                     len(candidates))
+        else:
+            log.info("--recover: un-marked %d orphan(s); next poll will re-process",
+                     len(candidates))
+        sys.exit(0)
+
     worker = CaptureWorker(state, client, opencode_cmd)
     poller = ReactionPoller(state, client, worker, interval, reactions)
 
@@ -1719,16 +1775,15 @@ def main():
     HarvestHandler.worker = worker
 
     # Recovery sweep (ISSUES.md #10): un-mark seen entries with no corresponding
-    # .md file in the expected dated dir. Catches silent losses from before
-    # ISSUES.md #1's verification landed. Runs every startup; cheap (only scans
-    # seen.json entries from the last 30 days).
+    # capture file in the expected date dir. As of 2026-06-10 (ISSUES.md #11)
+    # this is REPORT-ONLY at startup — auto-un-marking caused duplicate
+    # captures during a GoogleDrive sync race. Use `python harvester.py
+    # --recover` after confirming the filesystem is in steady state to
+    # actually un-mark orphans.
     if state.has_credentials():
         try:
-            recovered = state.recovery_sweep(max_age_days=30)
-            if recovered:
-                log.info("Recovery sweep: un-marked %d historical orphan(s); "
-                         "will retry on next poll", recovered)
-            else:
+            candidates = state.recovery_sweep(max_age_days=30, auto_unmark=False)
+            if not candidates:
                 log.info("Recovery sweep: no orphans found")
         except Exception as e:
             log.error("Recovery sweep failed: %s", e, exc_info=True)

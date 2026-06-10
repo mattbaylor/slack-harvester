@@ -114,6 +114,36 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 
 ## Priority 4 — quality and consistency
 
+### #11 — 🟢 Recovery sweep races cloud-sync after layout migration (FIXED 2026-06-10)
+
+**Where:** `harvester.py:recovery_sweep` (called at startup).
+**Symptom:** After a one-shot layout migration (e.g. flat `{slug}.md` →
+folder `{slug}/capture.md`), restarting the harvester before the cloud sync
+(GoogleDrive, Dropbox, network mount) has fully propagated the new
+filesystem shape causes `find_orphaned_seen` to glob an incomplete view of
+disk. It declares N real captures as orphans, un-marks them, and the next
+poll re-processes them — producing duplicate capture folders with
+`-{last6-ts}` collision suffixes.
+**Observed:** 2026-06-10. Migrated 61 captures in the sandbox; harvester
+started ~27 min later under launchd; GoogleDrive hadn't finished syncing
+the new folder layout to the launchd-process view. Sweep un-marked 7
+"orphans"; 5 produced duplicate folders (the other 2 lost the race some
+other way). Cleaned up manually.
+**Fix shipped (final):** `recovery_sweep` is now REPORT-ONLY at startup.
+It logs candidate orphans at WARNING but does not un-mark anything.
+First attempt (a 3-second re-verify delay) was insufficient — the
+launchd-spawned process's filesystem view doesn't refresh on a simple
+sleep+rescan when GoogleDrive sync is in flight. The clean shape is
+human-in-the-loop: run `python harvester.py --recover` (or `--recover
+--dry-run` to preview) explicitly, after confirming the filesystem is
+in steady state (e.g. GoogleDrive menu-bar icon shows synced).
+
+The trade-off: silent losses are now visible (logged loudly at startup)
+but won't auto-recover. Acceptable because (a) silent losses are rare
+in the post-stdout-only-redesign era, and (b) automatic recovery of
+"missing" files that aren't actually missing is more dangerous than
+the absence of recovery for genuine losses.
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -136,6 +166,7 @@ Update `config.json`. One-time migration: move the existing profile dir, re-poin
 |---|---|---|
 | 1 | #1, #2, #5, #9a, #10 | 🟢 Shipped 2026-06-03. Stdout-only redesign + un-mark-on-failure + recovery sweep + startup self-test. |
 | 2 | #8 + asset capture | 🟢 Shipped 2026-06-10. Folder-per-capture layout + asset download + migration tools. Closed orphan dirs. |
+| 2b | #11 | 🟢 Shipped 2026-06-10. Recovery-sweep cloud-sync race guard (refuse if >20% orphan fraction). |
 | 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |

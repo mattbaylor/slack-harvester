@@ -251,6 +251,7 @@ The harvester reads Slack's `xoxc` session token from Chrome's `localStorage` Le
 
 - **Capture-level failures** (opencode error, network drop mid-fetch, etc.) park raw JSON to `{capture_dir}/_pending/`. The dedup ledger entry is un-marked so the next poll retries automatically. Persistent failures stay parked; clean up manually after fixing the underlying issue.
 - **Asset-level failures** (one or more attached files won't download) park to `{capture_dir}/YYYY-MM-DD/{slug}/_pending-images.json`. The capture itself ships. Retry with `python3 harvester.py --retry-pending`. See "Attached files" above.
+- **Silent losses** (entries in `seen.json` with no matching capture file on disk) are detected by the recovery sweep at startup but are NOT auto-recovered (avoids spurious duplicates from cloud-sync races; see ISSUES.md #11). After confirming the filesystem is in steady state (e.g. GoogleDrive synced), run `python3 harvester.py --recover` (or `--recover --dry-run` to preview) to un-mark the orphans so the next poll re-processes them.
 - Slack rate limits are handled with `Retry-After` backoff.
 - Auth failures trigger an automatic credential re-read from the Chrome profile.
 
