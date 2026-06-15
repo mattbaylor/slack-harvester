@@ -74,6 +74,21 @@ ASSET_DOWNLOAD_TIMEOUT = 60            # Per-file, seconds.
 # (PDF, video, zip, etc.) gets a plain link in the Files appendix only.
 ASSET_INLINE_MIME_PREFIXES = ("image/",)
 
+# Magic-byte prefixes for the image formats Slack will serve. Used to detect
+# the case where Slack returns 200 OK with the sign-in HTML page in place of
+# the image (auth failure manifesting as content corruption, not HTTP error).
+# See ISSUES.md #12.
+IMAGE_MAGIC_BYTES = (
+    b"\x89PNG\r\n\x1a\n",   # PNG
+    b"\xff\xd8\xff",         # JPEG
+    b"GIF87a",
+    b"GIF89a",
+    b"BM",                   # BMP
+    b"<svg",                 # SVG (also handled via _looks_like_html for <?xml)
+    b"<?xml",                # SVG with XML prolog
+)
+# WebP and HEIC have a magic at offset 8 (RIFF/ftyp container), checked separately.
+
 log = logging.getLogger("harvester")
 
 # ---------------------------------------------------------------------------
@@ -445,13 +460,22 @@ class SlackClient:
             return channel_id
 
     def download_file(self, url: str, dest: Path, timeout: int = 60,
-                      max_bytes: Optional[int] = None) -> int:
+                      max_bytes: Optional[int] = None,
+                      expected_mimetype: Optional[str] = None) -> int:
         """Download a Slack-hosted file (url_private or similar) to dest.
 
-        Auth model: Slack file CDN accepts the same xoxc Bearer token used for
-        Web API calls. The d cookie is not required for file downloads (it's
-        a different code path on Slack's side). Confirmed against
-        files.slack.com hosts.
+        Auth model: Slack file CDN requires BOTH the xoxc Bearer token AND the
+        d cookie. Without the cookie, files.slack.com returns 200 OK with the
+        sign-in HTML page as the body — the Content-Type may even mirror the
+        requested file type. This produces silent corruption (e.g. a 67KB
+        "image/png" that is actually HTML). See ISSUES.md #12.
+
+        Guards (defense in depth):
+          1. Both token + cookie required (mirrors Web API auth).
+          2. Response Content-Type sniffed: text/html or similar → auth failure.
+          3. First bytes magic-sniffed for HTML.
+          4. If expected_mimetype starts with "image/", body must begin with a
+             known image magic; else treated as content corruption.
 
         Args:
             url: Slack file URL (typically url_private from files[]).
@@ -461,25 +485,36 @@ class SlackClient:
                        exceeds this, the download is aborted before writing.
                        If Content-Length is missing, streams up to max_bytes
                        and aborts if exceeded.
+            expected_mimetype: If provided and starts with "image/", validates
+                       the downloaded bytes match a known image magic.
 
         Returns:
             Bytes written.
 
         Raises:
-            RuntimeError on auth failure (4xx) or transport failure.
-            RuntimeError if max_bytes exceeded.
+            RuntimeError on auth failure (HTTP or HTML-body sniff), transport
+            failure, size cap, or content-type mismatch.
         """
-        if not self.state.token:
-            raise RuntimeError("No credentials for file download")
+        if not self.state.token or not self.state.cookie:
+            raise RuntimeError("No credentials for file download (need token+cookie)")
 
         req = Request(url, method="GET")
         req.add_header("Authorization", f"Bearer {self.state.token}")
-        # Cookie not needed for file downloads; deliberately omitted.
+        req.add_header("Cookie", f"d={self.state.cookie}")
 
         try:
             resp = urlopen(req, timeout=timeout)
         except Exception as e:
             raise RuntimeError(f"Download failed (transport): {e}")
+
+        # Response Content-Type guard. Slack returns HTML on auth failure even
+        # when the URL implies an image; catch that before writing anything.
+        resp_ct = (resp.headers.get("Content-Type") or "").lower()
+        if "html" in resp_ct or "text/html" in resp_ct:
+            raise RuntimeError(
+                f"Download produced HTML response (auth failure?); "
+                f"Content-Type={resp_ct!r}"
+            )
 
         # Pre-flight size check from Content-Length when available.
         cl = resp.headers.get("Content-Length")
@@ -492,8 +527,10 @@ class SlackClient:
             except ValueError:
                 pass  # Bad header, fall through to streamed cap
 
-        # Stream to disk with a streaming cap as a backstop.
+        # Stream to disk with a streaming cap as a backstop. Capture the first
+        # chunk's leading bytes for magic-byte validation after the stream.
         bytes_written = 0
+        first_bytes = b""
         chunk = 64 * 1024
         try:
             with open(dest, "wb") as f:
@@ -501,6 +538,8 @@ class SlackClient:
                     buf = resp.read(chunk)
                     if not buf:
                         break
+                    if not first_bytes:
+                        first_bytes = buf[:32]
                     bytes_written += len(buf)
                     if max_bytes is not None and bytes_written > max_bytes:
                         # Abort and unlink the partial file.
@@ -524,15 +563,78 @@ class SlackClient:
             raise RuntimeError(f"Download failed (write): {e}")
 
         if bytes_written == 0:
-            # Slack returns HTML login page on auth failure with 200 OK
-            # for some URL shapes. Empty body is also suspicious.
             try:
                 dest.unlink()
             except OSError:
                 pass
             raise RuntimeError("Download produced empty file (auth or URL issue?)")
 
+        # HTML sniff on body bytes (independent of response Content-Type header,
+        # in case Slack returns text/html as application/octet-stream).
+        if self._looks_like_html(first_bytes):
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                "Download produced HTML body (auth failure?); "
+                f"first bytes={first_bytes[:16]!r}"
+            )
+
+        # Image magic-byte validation when the caller declared an image.
+        if expected_mimetype and expected_mimetype.lower().startswith("image/"):
+            if not self._looks_like_image(first_bytes):
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Download mimetype mismatch: expected {expected_mimetype}, "
+                    f"got bytes that don't match any known image magic "
+                    f"(first 16 bytes={first_bytes[:16]!r})"
+                )
+
         return bytes_written
+
+    @staticmethod
+    def _looks_like_html(buf: bytes) -> bool:
+        """Heuristic: does this byte string look like the start of an HTML doc?
+
+        Handles the Slack auth-failure case where the sign-in page comes back
+        with arbitrary Content-Type. Case-insensitive on the well-known tags.
+        """
+        if not buf:
+            return False
+        head = buf[:64].lstrip().lower()
+        return (
+            head.startswith(b"<!doctype html")
+            or head.startswith(b"<html")
+            or head.startswith(b"<head")
+        )
+
+    @staticmethod
+    def _looks_like_image(buf: bytes) -> bool:
+        """Magic-byte check for image formats Slack will serve.
+
+        Covers PNG, JPEG, GIF, BMP, WebP, HEIC, SVG. Returns False for HTML,
+        text, or unknown binary content.
+        """
+        if not buf:
+            return False
+        # Common magics (prefix match).
+        for magic in IMAGE_MAGIC_BYTES:
+            if buf.startswith(magic):
+                return True
+        # WebP: "RIFF....WEBP" at offset 0/8.
+        if len(buf) >= 12 and buf[0:4] == b"RIFF" and buf[8:12] == b"WEBP":
+            return True
+        # HEIC / HEIF: "....ftypheic" / "ftypheix" / "ftypmif1" at offset 4.
+        if len(buf) >= 12 and buf[4:8] == b"ftyp" and buf[8:12] in (
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis",
+            b"mif1", b"msf1",
+        ):
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +937,7 @@ class CaptureWorker:
                     cand["url"], dest,
                     timeout=ASSET_DOWNLOAD_TIMEOUT,
                     max_bytes=ASSET_MAX_BYTES,
+                    expected_mimetype=cand.get("mimetype") or None,
                 )
                 log.info("  asset %s ← %s (%d bytes, %s)",
                          filename, cand.get("original_name") or "<unnamed>", size,
@@ -1511,6 +1614,7 @@ def run_retry_pending(state: HarvesterState, client: SlackClient,
                     url, dest,
                     timeout=ASSET_DOWNLOAD_TIMEOUT,
                     max_bytes=ASSET_MAX_BYTES,
+                    expected_mimetype=item.get("mimetype") or None,
                 )
                 log.info("    %s: succeeded (%d bytes)", filename, size)
                 newly_succeeded.append({

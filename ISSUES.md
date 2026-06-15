@@ -144,6 +144,46 @@ in the post-stdout-only-redesign era, and (b) automatic recovery of
 "missing" files that aren't actually missing is more dangerous than
 the absence of recovery for genuine losses.
 
+### #12 — 🟢 Image downloads silently saved Slack sign-in HTML as `NN.png` (FIXED 2026-06-15)
+
+**Where:** `harvester.py:SlackClient.download_file` (asset download path).
+**Symptom:** Captures with image attachments produce `NN.png` files that
+are HTML, not PNG. The capture pipeline reports success: log says
+`asset 01.png ← Screenshot ... (69145 bytes, image/png)`, frontmatter
+records the asset, body inline-embeds `![alt](01.png)`, no
+`_pending-images.json` is written. Opening the "image" in Obsidian
+shows a broken-image icon; `file 01.png` reports `HTML document text`;
+`hexdump` of the first bytes shows `<!DOCTYPE html>` — the Slack sign-in
+page.
+**Observed:** 2026-06-15. Capture `2026-06-15-john-capture/01.png`,
+69145 bytes, magic bytes `<!DOCTYPE html`, body content the Slack
+web sign-in page.
+**Cause:** `download_file` deliberately omitted the `d` cookie based
+on a (wrong) belief that `files.slack.com` accepts the `xoxc` Bearer
+token alone. Empirically, Slack's file CDN requires BOTH `xoxc` AND
+the `d` cookie. Without the cookie it returns 200 OK with the
+sign-in HTML page as the body, and the response Content-Type can
+mirror the requested file type — so the existing guards all passed:
+the pre-flight Content-Length check saw a real number, the streamed
+size cap wasn't exceeded, and the empty-body heuristic missed
+because the file isn't empty, it's 67 KB of HTML.
+**Fix shipped:** Three layers of defense in `download_file`:
+1. Require `state.cookie` alongside `state.token` and send it as
+   `Cookie: d={cookie}`, matching the Web API auth path.
+2. Sniff the response `Content-Type` header; any `text/html` →
+   raise immediately, no bytes written.
+3. After streaming, sniff first 32 bytes: if they look like HTML
+   (`<!doctype html`, `<html`, `<head`) → unlink, raise. If the
+   caller passed an `expected_mimetype` starting with `image/`,
+   validate the bytes against known image magics (PNG, JPEG, GIF,
+   BMP, WebP, HEIC, SVG); on mismatch → unlink, raise.
+
+Failure messages are routed through the existing
+`_pending-images.json` parking flow, so failed images now leave a
+recoverable paper trail instead of silent HTML corruption.
+**Not in scope:** Recovery of already-corrupted captures. Per user
+direction, fix forward only — bad files stay where they are.
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -167,6 +207,7 @@ the absence of recovery for genuine losses.
 | 1 | #1, #2, #5, #9a, #10 | 🟢 Shipped 2026-06-03. Stdout-only redesign + un-mark-on-failure + recovery sweep + startup self-test. |
 | 2 | #8 + asset capture | 🟢 Shipped 2026-06-10. Folder-per-capture layout + asset download + migration tools. Closed orphan dirs. |
 | 2b | #11 | 🟢 Shipped 2026-06-10. Recovery-sweep cloud-sync race guard (refuse if >20% orphan fraction). |
+| 2c | #12 | 🟢 Shipped 2026-06-15. Image download auth fix (`d` cookie) + HTML/magic-bytes guards. |
 | 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |
