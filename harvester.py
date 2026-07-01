@@ -388,16 +388,36 @@ class SlackClient:
         return data
 
     def get_message(self, channel: str, ts: str) -> dict:
-        data = self._call("conversations.history", {
+        """Fetch a specific message by ts. Works for both top-level messages
+        and thread replies.
+
+        conversations.history does NOT return thread replies — it only
+        surfaces top-level channel messages. Using it with latest=<reply_ts>
+        silently returns the top-level message at or before that ts, which
+        is a completely unrelated message. That silent substitution caused
+        the wrong-content capture documented in
+        `~/vault/00-inbox/2026-07-01-slack-harvester-get-message-wrong-for-thread-replies.md`.
+
+        conversations.replies works for both cases:
+        - If ts is a thread reply: returns parent + all replies; we pick
+          the one matching ts.
+        - If ts is a thread parent: returns the parent (with thread_ts == ts).
+        - If ts is a non-threaded top-level message: returns a single-element
+          list with just that message.
+
+        Same one API call as before; no downstream changes needed.
+        """
+        data = self._call("conversations.replies", {
             "channel": channel,
-            "latest": ts,
-            "limit": 1,
+            "ts": ts,
+            "limit": 200,
             "inclusive": "true",
         })
         messages = data.get("messages", [])
-        if not messages:
-            raise RuntimeError(f"Message not found: {channel}/{ts}")
-        return messages[0]
+        for m in messages:
+            if m.get("ts") == ts:
+                return m
+        raise RuntimeError(f"Message not found: {channel}/{ts}")
 
     def get_thread(self, channel: str, thread_ts: str) -> list[dict]:
         data = self._call("conversations.replies", {
@@ -763,6 +783,18 @@ class CaptureWorker:
 
         # Step 1: Fetch the reacted message to check for thread_ts
         msg = self.client.get_message(channel, ts)
+        # Defensive: if get_message ever returns the wrong message (as it
+        # historically did for thread replies via conversations.history —
+        # see ~/vault/00-inbox/2026-07-01-slack-harvester-get-message-wrong-for-thread-replies.md),
+        # fail loudly rather than silently populating the capture with the
+        # wrong content.
+        if msg.get("ts") != ts:
+            raise RuntimeError(
+                f"get_message returned wrong message: asked for ts={ts}, "
+                f"got ts={msg.get('ts')} in channel {channel}. "
+                f"This is the thread-reply substitution bug — verify "
+                f"conversations.replies fallback in get_message."
+            )
         thread_ts = msg.get("thread_ts")
 
         # Step 2: Fetch context
