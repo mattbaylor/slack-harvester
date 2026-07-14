@@ -184,6 +184,54 @@ recoverable paper trail instead of silent HTML corruption.
 **Not in scope:** Recovery of already-corrupted captures. Per user
 direction, fix forward only — bad files stay where they are.
 
+### #13 — 🟢 Unresolved `<@Uxxxx>` mentions let opencode hallucinate names (FIXED 2026-07-13)
+
+**Where:** `harvester.py:CaptureWorker.process` (Step 3 name resolution)
+and `_invoke_opencode` (body prompt).
+**Symptom:** When a captured message `@`-mentions people, the wrong name
+can appear in the capture body. Observed: capture
+`2026-07-13/2026-07-13-riverginther-so-don-forget/capture.md` rendered
+River's opening ping as `[[John]] [[Josh Wilson]] [[Marco Rangel]]` when
+the message actually pinged **John, jwilson, and matt**. The word "Marco"
+was pulled from a *later* sentence in the same message ("Marco is busy
+with closure compiler…") — a plausible-but-wrong substitution.
+**Cause:** Name resolution (`resolve_user`) was only applied to message
+**authors** (to build `participants`). Slack mention markup embedded
+*inside* message text (`<@Uxxxx>`, `<#Cxxxx|name>`, `<!subteam^Sxxxx>`)
+was never resolved. The raw text — still carrying `<@U0ATR90VBMJ>` —
+was passed to opencode in the bundle (`reacted_message_text`) and stored
+verbatim in the `reacted_message` frontmatter. opencode has **no access
+to the user cache**, so it cannot resolve a raw id; the body-generation
+prompt's "use `[[Display Name]]` wiki-links" instruction then forced it to
+invent a name, which it did by pattern-matching nearby text. The only
+prior handling of `<@…>` was in `_build_slug`, which merely *strips* the
+markup for topic-word extraction (`re.sub(r"<[^>]+>", " ", text)`).
+**Root property:** opencode is a stateless markdown generator by design
+(see README "Why opencode is stdout-only"). Any id it receives that it
+can't resolve is an invitation to hallucinate. The fix keeps id→name
+resolution entirely in Python, where the cache lives.
+**Fix shipped:** New `SlackClient.expand_mentions(text)` — a deterministic,
+cache-backed pass that rewrites `<@Uxxxx>`/`<@Uxxxx|label>` → `@name`,
+`<#Cxxxx|name>`/`<#Cxxxx>` → `#name`, `<!subteam^Sxxxx|@grp>` → `@grp`,
+and `<!here|channel|everyone>` → `@here` etc. Applied in Step 3 to every
+context message's `text` in-place, and applied explicitly to the reacted
+message text at Step 7 (the reacted `msg` is a separate object fetched via
+`get_message`, so the Step-3 loop does not touch it). Both the opencode
+prompt and the Python-built frontmatter now see real names only —
+structurally removing opencode's opportunity to guess. Bare link markup
+(`<https://…>`, `<https://…|label>`) is left untouched (regex only matches
+`<@`, `<#`, `<!`). Verified against the ARTI-281 raw ids using the live
+`users-cache.json`: the three-name ping expands to `@John @jwilson @matt`.
+**Backfilled:** The ARTI-281 capture body, `reacted_message` frontmatter,
+and action items were manually corrected (Marco Rangel → Matt for the
+opening ping; the separate "Marco is on closure-compiler work" reference
+was already correct and left as-is). `participants` was already correct
+(authors, not mentions) and untouched.
+**Not in scope:** Sweeping other historical captures for the same class
+of error. Fix-forward; any pre-2026-07-13 capture with `<@…>` in its
+`reacted_message` frontmatter is a candidate for the same latent bug if
+ever re-examined.
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.

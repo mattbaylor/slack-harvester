@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -479,6 +480,65 @@ class SlackClient:
             log.warning("Failed to resolve channel %s: %s", channel_id, e)
             return channel_id
 
+    # Slack markup for mentions/links inside message text. Resolved to
+    # human-readable names BEFORE the text reaches opencode or the
+    # frontmatter, so nothing downstream ever sees a raw <@Uxxxx> id.
+    #
+    # Why this matters: opencode (the body generator) has no access to the
+    # user cache. If it receives a raw <@U0ATR90VBMJ>, it cannot resolve it
+    # and will hallucinate a plausible-but-wrong name by pattern-matching the
+    # surrounding text (observed 2026-07-13: mentioned "matt" rendered as
+    # "Marco Rangel" because the next sentence mentioned Marco). See ISSUES.md.
+    _MENTION_RE = re.compile(
+        r"<"
+        r"(?:"
+        r"@(?P<user>[UW][A-Z0-9]+)"                  # <@U123> or <@U123|label>
+        r"|#(?P<channel>C[A-Z0-9]+)(?:\|(?P<clabel>[^>]*))?"  # <#C123|name>
+        r"|!subteam\^(?P<subteam>S[A-Z0-9]+)(?:\|(?P<slabel>[^>]*))?"  # <!subteam^S123|@grp>
+        r"|!(?P<special>here|channel|everyone)"      # <!here> <!channel> <!everyone>
+        r")"
+        r"(?:\|(?P<ulabel>[^>]*))?"                  # optional |label on user mentions
+        r">"
+    )
+
+    def expand_mentions(self, text: str) -> str:
+        """Replace Slack mention/link markup in a message body with names.
+
+        - <@Uxxxx>            → the user's cached display name
+        - <@Uxxxx|label>      → same (label ignored; cache is canonical)
+        - <#Cxxxx|name>       → #name  (falls back to resolve_channel)
+        - <#Cxxxx>            → resolve_channel
+        - <!subteam^Sxxxx|@g> → @g     (label preserved; no cheap id→name API)
+        - <!here|channel|…>   → @here / @channel / @everyone
+
+        Deterministic and cache-backed. Applied to reacted-message text and
+        every context message before the bundle is built, so both the
+        opencode prompt and the deterministic frontmatter see real names.
+        Unresolvable ids degrade to the raw id (never crash the capture).
+        """
+        if not text or "<" not in text:
+            return text
+
+        def _sub(match: "re.Match") -> str:
+            if match.group("user"):
+                # Prefer the canonical cache/API name over any inline label —
+                # labels can be stale or a raw id echoed by Slack.
+                return f"@{self.resolve_user(match.group('user'))}"
+            if match.group("channel"):
+                label = match.group("clabel")
+                if label:
+                    return f"#{label}"
+                return self.resolve_channel(match.group("channel"))
+            if match.group("subteam"):
+                label = match.group("slabel")
+                # Labels like "@team-articuno" already carry the @; keep as-is.
+                return label if label else f"@{match.group('subteam')}"
+            if match.group("special"):
+                return f"@{match.group('special')}"
+            return match.group(0)
+
+        return self._MENTION_RE.sub(_sub, text)
+
     def download_file(self, url: str, dest: Path, timeout: int = 60,
                       max_bytes: Optional[int] = None,
                       expected_mimetype: Optional[str] = None) -> int:
@@ -806,6 +866,15 @@ class CaptureWorker:
             context_type = "channel"
 
         # Step 3: Resolve names
+        #
+        # Two distinct resolutions happen here:
+        #  (a) the message AUTHOR id -> display name (feeds `participants`)
+        #  (b) any <@Uxxxx> / <#Cxxxx> / <!subteam^…> mentions INSIDE the
+        #      message text -> readable names, rewritten in-place on the
+        #      message dict so both the frontmatter and the opencode prompt
+        #      only ever see names. Without (b), raw ids reach opencode, which
+        #      cannot resolve them and hallucinates plausible-but-wrong names
+        #      (2026-07-13: "matt" rendered as "Marco Rangel"). See ISSUES.md.
         participants = set()
         for m in messages:
             uid = m.get("user")
@@ -813,6 +882,8 @@ class CaptureWorker:
                 name = self.client.resolve_user(uid)
                 m["_display_name"] = name
                 participants.add(name)
+            if m.get("text"):
+                m["text"] = self.client.expand_mentions(m["text"])
 
         channel_name = self.client.resolve_channel(channel)
 
@@ -831,7 +902,12 @@ class CaptureWorker:
 
         # Step 7: Convert Slack ts to ISO datetime
         msg_date = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-        reacted_text = msg.get("text", "")
+        # `msg` is fetched independently via get_message and is a DIFFERENT
+        # object from its counterpart in `messages`, so the Step-3 in-place
+        # mention expansion did not touch it. Expand here explicitly — this is
+        # the text that populates both the `reacted_message` frontmatter and
+        # the opencode `reacted_message_text`, so it must carry real names.
+        reacted_text = self.client.expand_mentions(msg.get("text", ""))
 
         # Step 8: Enumerate asset candidates from the message stream.
         # files[] is the primary source. blocks[].image blocks also count
@@ -1331,8 +1407,6 @@ Return only the markdown body. Do not invoke any tools. Do not write to any file
         Deterministic, no model involvement. Derives the topic from the
         reacted message's first words, lowercased, alphanumeric only.
         """
-        import re
-
         # Author last name. "First Last" -> "last". Falls back to full
         # display name slugified if there's no obvious split.
         author = bundle.get("author") or "unknown"
