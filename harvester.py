@@ -74,6 +74,97 @@ def load_config(config_path: Path) -> dict:
 SLACK_API = "https://slack.com/api"
 CACHE_MAX_AGE_DAYS = 7
 
+# Channel-context time-gap segmentation (ISSUES #15).
+# In a quiet DM, "the last N messages" (conversations.history by count) can
+# reach back days, pulling a stale prior conversation into a capture. We trim
+# the fetched window at the first inter-message gap larger than this threshold,
+# walking backward from the reacted (anchor) message, so the capture is bounded
+# to its own conversational burst. 6h is generous enough to keep a real working
+# session with a lunch/meeting break intact, tight enough that overnight and
+# multi-day silences sever. Overridable via config.json `context_max_gap_hours`.
+DEFAULT_CONTEXT_MAX_GAP_HOURS = 6
+
+
+def _resolve_context_max_gap_seconds(config: Optional[dict]) -> float:
+    """Resolve the context time-gap threshold, in seconds, from config.
+
+    Reads `context_max_gap_hours` from the given config dict if present and
+    positive; otherwise falls back to DEFAULT_CONTEXT_MAX_GAP_HOURS. Pure —
+    no I/O, no globals mutated. `config` may be None or missing the key.
+
+    A non-positive or unparseable override is ignored (falls back to the
+    default) rather than silently disabling segmentation, since a 0h window
+    would collapse every capture to the anchor alone.
+    """
+    hours = DEFAULT_CONTEXT_MAX_GAP_HOURS
+    if config:
+        raw = config.get("context_max_gap_hours")
+        if raw is not None:
+            try:
+                candidate = float(raw)
+                if candidate > 0:
+                    hours = candidate
+            except (TypeError, ValueError):
+                log.warning(
+                    "Invalid context_max_gap_hours=%r in config; using default %sh",
+                    raw, DEFAULT_CONTEXT_MAX_GAP_HOURS,
+                )
+    return hours * 3600.0
+
+
+def _segment_context_by_gap(messages: list[dict], max_gap_seconds: float) -> list[dict]:
+    """Trim a chronological context window to the anchor's conversational burst.
+
+    Pure function — no `self`, no network, no opencode. Given a list of Slack
+    message dicts in CHRONOLOGICAL order (anchor last), each carrying a `ts`
+    string (unix epoch with microseconds, e.g. "1784148148.166149"), return the
+    sublist that belongs to the same burst as the anchor: walk backward from the
+    anchor and keep each earlier message only while the gap to the next-newer
+    KEPT message is <= max_gap_seconds. Cut at the first gap > threshold; drop
+    everything older.
+
+    Guarantees:
+    - Never empty: always returns at least [anchor] (a lone message after a
+      long silence needs no borrowed context — RESOLVED SQ2, ISSUES #15).
+    - Anchor (chronologically newest / last element) is always kept and remains
+      last in the returned list.
+    - Result stays in chronological order.
+    - Only ever shrinks the window; the count cap upstream stays an outer bound.
+
+    Defensive choices:
+    - Order is NOT trusted: we sort by float(ts) ascending first, so the anchor
+      is unambiguously the max-ts element regardless of the input order.
+    - Messages with a missing or malformed `ts` are treated conservatively as
+      ts=0.0 (effectively ancient), so a message we can't place in time sorts to
+      the far past and is cut by the first real gap rather than being allowed to
+      masquerade as adjacent to the anchor. (A malformed anchor ts is the sole
+      degenerate case where this could misorder; in practice the anchor's ts is
+      the well-formed value the capture keys on.)
+    """
+    if not messages:
+        return []
+
+    def _ts_of(m: dict) -> float:
+        try:
+            return float(m.get("ts", ""))
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Don't trust input order — sort ascending so the anchor is the last element.
+    ordered = sorted(messages, key=_ts_of)
+
+    kept_reversed = [ordered[-1]]          # anchor always kept
+    prev_ts = _ts_of(ordered[-1])
+    for m in reversed(ordered[:-1]):       # walk backward from just before anchor
+        this_ts = _ts_of(m)
+        if prev_ts - this_ts > max_gap_seconds:
+            break                          # first over-threshold gap severs
+        kept_reversed.append(m)
+        prev_ts = this_ts
+
+    kept_reversed.reverse()                # restore chronological order
+    return kept_reversed
+
 # Asset capture (folder-per-capture layout). Files attached to a Slack message
 # are downloaded into the capture folder as 01.ext, 02.ext, etc.
 ASSET_MAX_BYTES = 100 * 1024 * 1024   # 100 MB; larger files skip and park.
@@ -109,10 +200,15 @@ class HarvesterState:
     """Thread-safe state container."""
 
     def __init__(self, vault: Path, capture_dir: str, chrome_profile: Path,
-                 state_dir: Optional[Path] = None):
+                 state_dir: Optional[Path] = None, config: Optional[dict] = None):
         self.vault = vault
         self.capture_dir = capture_dir
         self.chrome_profile = chrome_profile
+        # Full resolved config dict, so components that hold `state` (e.g.
+        # SlackClient) can read tunables without a separate plumbing path.
+        # Defaults to {} when not supplied (e.g. hermetic tests that don't
+        # construct the full app). See _resolve_context_max_gap_seconds (#15).
+        self.config = config or {}
         self.state_dir = state_dir or (vault / capture_dir / "_state")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (vault / capture_dir / "_pending").mkdir(parents=True, exist_ok=True)
@@ -447,8 +543,14 @@ class SlackClient:
             "inclusive": "true",
         })
         messages = data.get("messages", [])
-        messages.reverse()  # Chronological order
-        return messages
+        messages.reverse()  # Chronological order (anchor last)
+        # Bound the window to the anchor's own conversational burst so a quiet
+        # DM's "last N messages" doesn't drag a days-old prior conversation into
+        # the capture (ISSUES #15). count stays as an outer cap — segmentation
+        # only ever shrinks. Threshold from config.json `context_max_gap_hours`,
+        # else the 6h default.
+        max_gap_seconds = _resolve_context_max_gap_seconds(self.state.config)
+        return _segment_context_by_gap(messages, max_gap_seconds)
 
     def get_permalink(self, channel: str, ts: str) -> str:
         data = self._call("chat.getPermalink", {
@@ -1261,6 +1363,37 @@ class CaptureWorker:
                 log.warning("Cleanup after failure also failed: %s", cleanup_err)
             raise
 
+    @staticmethod
+    def _build_body_prompt(bundle_json: str, asset_instructions: str = "") -> str:
+        """Compose the opencode body-generation prompt string.
+
+        Factored out of `_generate_body_via_opencode` so the exact prompt text
+        (including the time-gap boundary rule, ISSUES #15) can be asserted in a
+        hermetic unit test without a live opencode round-trip and without the
+        test asserting a hand-copied duplicate of the prompt.
+        """
+        return f"""You are processing a captured Slack message. Return ONLY the markdown body text. No frontmatter. No preamble. No "Here is the markdown" wrapper. No code fence around the whole output. Just the body content, ready to be appended to a markdown file.
+
+## Input data (JSON)
+
+```json
+{bundle_json}
+```
+
+## Body requirements
+
+- Start with a 1-2 sentence summary of what was captured and why it matters.
+- Include the key content — decisions, action items, links, important context.
+- If this is a thread, preserve the thread structure with author attribution.
+- If this is channel context, focus on the reacted message and include relevant surrounding context only.
+- Messages separated from the reacted message by a large time gap (compare the `ts` fields) belong to a DIFFERENT, earlier conversation — exclude them entirely unless the reacted message directly references them. Do not weave a days-old prior discussion into the summary as if it were continuous with the reacted message. This applies only to large gaps; keep genuinely-adjacent context (the same burst of messages minutes or hours apart).
+- Filter out noise (reactions-only messages, "thanks", join/leave, etc.).
+- For references to people, use `[[Display Name]]` wiki-links.
+- Preserve code blocks, links, and structured data inside the body.
+{asset_instructions}
+Return only the markdown body. Do not invoke any tools. Do not write to any files. Do not output anything other than the body text.
+"""
+
     def _generate_body_via_opencode(self, bundle: dict,
                                     assets: list[dict]) -> str:
         """Run opencode to turn the bundle into curated markdown body text.
@@ -1317,26 +1450,7 @@ must appear at least once, inline.
         else:
             asset_instructions = ""
 
-        prompt = f"""You are processing a captured Slack message. Return ONLY the markdown body text. No frontmatter. No preamble. No "Here is the markdown" wrapper. No code fence around the whole output. Just the body content, ready to be appended to a markdown file.
-
-## Input data (JSON)
-
-```json
-{bundle_json}
-```
-
-## Body requirements
-
-- Start with a 1-2 sentence summary of what was captured and why it matters.
-- Include the key content — decisions, action items, links, important context.
-- If this is a thread, preserve the thread structure with author attribution.
-- If this is channel context, focus on the reacted message and include relevant surrounding context only.
-- Filter out noise (reactions-only messages, "thanks", join/leave, etc.).
-- For references to people, use `[[Display Name]]` wiki-links.
-- Preserve code blocks, links, and structured data inside the body.
-{asset_instructions}
-Return only the markdown body. Do not invoke any tools. Do not write to any files. Do not output anything other than the body text.
-"""
+        prompt = self._build_body_prompt(bundle_json, asset_instructions)
         try:
             result = subprocess.run(
                 [self.opencode_cmd, "run", prompt],
@@ -2127,7 +2241,8 @@ def main():
     log.info("Poll interval: %ds", interval)
     log.info("Trigger reactions: %s", ", ".join(f":{r}:" for r in reactions))
 
-    state = HarvesterState(vault, capture_dir, chrome_profile, state_dir=state_dir)
+    state = HarvesterState(vault, capture_dir, chrome_profile, state_dir=state_dir,
+                           config=cfg)
     client = SlackClient(state)
 
     # --retry-pending: one-shot orphan cleanup mode. Doesn't start the
