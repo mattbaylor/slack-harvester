@@ -1,0 +1,45 @@
+{
+  "_fixture_note": "SYNTHETIC fixture — NOT a real Slack API response. Hand-built at ISSUES #15 execute time (2026-07-16) from the timestamps recorded in the failed capture ~/vault/51-slack-captures/2026-07-15/2026-07-15-rangel-commented-some-things/capture.md (slack_ts 1784148148.166149, channel D0AUM6S6HQS). It reproduces the shape that broke the capture: a Friday 2026-07-10 ARTI-7 merge-session burst (five messages ~25 min apart), a ~5-day (~125h) silence, then the Wednesday 2026-07-15 PR-comment anchor burst (two messages minutes before the reacted message, then the reacted message itself). This is the CHRONOLOGICAL order (anchor last) that get_context produces after messages.reverse() — feed it straight into _segment_context_by_gap. TO REPLACE WITH A REAL WINDOW (deferred; requires Plan A / ISSUES #14 serve seam to be running on 127.0.0.1:7777): curl -s -H \"Authorization: Bearer $(cat ~/.local/state/slack-harvester/api-token)\" 'http://127.0.0.1:7777/slack?method=conversations.history&channel=D0AUM6S6HQS&latest=1784148148.166149&limit=16&inclusive=true' | jq '{messages: (.messages | reverse)}' > tests/fixtures/rangel-window.real.json  (the .real.json name is gitignored so a real DM transcript never lands in git; the O1 test prefers rangel-window.real.json when present, else falls back to this synthetic file).",
+  "messages": [
+    {
+      "user": "U_RANGEL",
+      "ts": "1783694548.166149",
+      "text": "unsure where to find the ... menu; couldn't see it in the conversation/user details view <https://github.com/Banno/platform-ux/pull/16963|PR #16963>"
+    },
+    {
+      "user": "U_MATT",
+      "ts": "1783694668.166149",
+      "text": "Good instinct — the Conversations pop-out never renders the overflow menu, on this branch or master. Not a click-to-verify PR; meaningful checks are yarn build green + clean jha-* -> jh-* tag swap."
+    },
+    {
+      "user": "U_RANGEL",
+      "ts": "1783695448.166149",
+      "text": "Re-review checks pass — good to merge?"
+    },
+    {
+      "user": "U_MATT",
+      "ts": "1783695508.166149",
+      "text": "If you're good with it, we're good."
+    },
+    {
+      "user": "U_RANGEL",
+      "ts": "1783696048.166149",
+      "text": "Merged 6/6."
+    },
+    {
+      "user": "U_MATT",
+      "ts": "1784147608.166149",
+      "text": "Pushed the ARTI-7 follow-up review round on 16969 if you want to take a look when you get a sec."
+    },
+    {
+      "user": "U_RANGEL",
+      "ts": "1784147968.166149",
+      "text": "sure, testing it now"
+    },
+    {
+      "user": "U_RANGEL",
+      "ts": "1784148148.166149",
+      "text": "Commented some things I noticed when testing: <https://github.com/Banno/platform-ux/pull/16969#pullrequestreview-4707976956|github.com/Banno/platform-ux/pull/16969#…>"
+    }
+  ]
+}

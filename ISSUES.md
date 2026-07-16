@@ -232,6 +232,62 @@ of error. Fix-forward; any pre-2026-07-13 capture with `<@…>` in its
 `reacted_message` frontmatter is a candidate for the same latent bug if
 ever re-examined.
 
+### #15 — 🟢 Count-only channel context pulls stale cross-day conversations (FIXED 2026-07-16)
+
+**Where:** `harvester.py:SlackClient.get_context` (channel-context fetch) and
+`harvester.py:CaptureWorker._build_body_prompt` (body prompt).
+**Symptom:** When a `:cap:`'d message sits in a quiet DM, the capture body
+weaves in a days-old prior conversation as if it were continuous context.
+Observed: capture
+`2026-07-15/2026-07-15-rangel-commented-some-things/capture.md` captured a
+one-line PR-comment ping (Wednesday 2026-07-15 14:42, PR #16969) but its
+"## Relevant context from earlier in the DM" section reconstructed Friday
+2026-07-10's entire ARTI-7 merge session (PR #16963 `...`-menu confusion, the
+screenshot, "Re-review checks pass — good to merge?", "Merged 6/6") — real
+content, but a *different* conversation across a ~5-day silence. It distorted
+the capture's framing and action item.
+**Cause:** `get_context` fetched context purely by **count** —
+`conversations.history` with `latest=ts, limit=16, inclusive=true`, then
+`messages.reverse()`. There was **no time window**. In a low-traffic DM, "the
+last 16 messages" reaches back days. The opencode prompt at ~:1322 ("include
+relevant surrounding context only") had no signal that a multi-day gap marks a
+topic boundary, so it treated the whole window as one thread. Same *class* as
+#13: opencode faithfully renders the misleading input it is handed.
+**Fix shipped:**
+1. New pure helper `_segment_context_by_gap(messages, max_gap_seconds)` — walks
+   backward from the anchor (chronologically-newest message), keeping each
+   earlier message only while the gap to the next-newer kept message is
+   `<= threshold`, cutting at the first larger gap and dropping everything
+   older. Sorts by `float(ts)` defensively first (doesn't trust order); treats
+   missing/malformed `ts` conservatively as ancient; never returns empty
+   (`>= [anchor]`) so a lone message after a long silence yields just itself.
+2. `get_context` calls it after `reverse()`, before returning. The `count=16`
+   stays as an outer cap — segmentation only ever shrinks.
+3. Threshold: named constant `DEFAULT_CONTEXT_MAX_GAP_HOURS = 6` with a
+   `config.json` override, `context_max_gap_hours`, resolved by the pure
+   `_resolve_context_max_gap_seconds` (invalid/non-positive → default). The full
+   resolved config now rides on `HarvesterState.config` so `SlackClient` (which
+   holds `state`) can read it without new plumbing. Documented in
+   `config.example.json`.
+4. Prompt tightened (`_build_body_prompt`, factored out of
+   `_generate_body_via_opencode`): messages separated from the reacted message
+   by a large time gap are a DIFFERENT conversation to exclude unless directly
+   referenced — narrowly worded ("large time gap") so genuinely-adjacent context
+   is still kept. Secondary guard for any threshold-adjacent survivor.
+**Tests:** `tests/test_context_gap_segmentation.py` — the repo's first fully
+hermetic test (no live Slack/opencode/Chrome). Covers all six ACs plus config
+resolution and defensive cases; asserts the prompt boundary-rule via the real
+`_build_body_prompt` code path (no copied string). Fixture at
+`tests/fixtures/rangel-window.json` is **synthetic** (built from the capture's
+timestamps; gitignored) with an inline note + the exact seam-fetch curl to
+replace it with a real window once Plan A / #14's seam is running.
+**Thread path untouched:** `get_thread` is already bounded by `thread_ts`; no
+diff there.
+**Not in scope:** Re-generating/backfilling historical captures (fix-forward
+per #12/#13); the real-window fixture fetch through the #14 seam (deferred —
+this ships with the synthetic fixture, MECHANISM-proven; O1 uplifts to
+OUTCOME-proven after a seam fetch).
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -256,6 +312,8 @@ ever re-examined.
 | 2 | #8 + asset capture | 🟢 Shipped 2026-06-10. Folder-per-capture layout + asset download + migration tools. Closed orphan dirs. |
 | 2b | #11 | 🟢 Shipped 2026-06-10. Recovery-sweep cloud-sync race guard (refuse if >20% orphan fraction). |
 | 2c | #12 | 🟢 Shipped 2026-06-15. Image download auth fix (`d` cookie) + HTML/magic-bytes guards. |
+| 2d | #13 | 🟢 Shipped 2026-07-13. Resolve `<@Uxxxx>` mentions in Python before opencode (stop name hallucination). |
+| 2e | #15 | 🟢 Shipped 2026-07-16. Time-gap segmentation bounds channel context to the anchor's conversational burst; prompt boundary rule + config knob (`context_max_gap_hours`, default 6h). First hermetic test. |
 | 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |

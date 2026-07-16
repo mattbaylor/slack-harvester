@@ -14,5 +14,6 @@
     "point_up",
     "noted"
   ],
-  "opencode_command": "opencode"
+  "opencode_command": "opencode",
+  "context_max_gap_hours": 6
 }
