@@ -247,6 +247,60 @@ The harvester reads Slack's `xoxc` session token from Chrome's `localStorage` Le
 - **No Chrome process needed** after initial sign-in. Credentials persist on disk.
 - **Token rotation**: If the token expires, sign into Slack again in the dedicated Chrome profile. The harvester picks up the new credentials on the next poll.
 
+## Read-only Slack proxy seam
+
+The harvester exposes one extra loopback route, `GET /slack`, that proxies an
+allow-listed set of **read-only** Slack API methods through the credentials the
+harvester has already loaded — and returns the raw Slack JSON.
+
+**Why this exists.** Sanctioned local agent tooling (and you) sometimes need a
+real Slack API result — e.g. a `conversations.history` window to build a test
+fixture. The only credential path is `chrome_creds.py`, which reads Chrome's
+cookie/token store under browser-profile paths that are EDR-watchlisted and
+off-limits to agents. This seam lets the harvester — whose Chrome-reading is its
+accepted job — make the call, so the caller only ever sees JSON. **The
+credentials never cross the wire.** The endpoint proxies calls; it never returns
+the `token` or `cookie`.
+
+**Auth.** The route is bound to `127.0.0.1` only and gated by a bearer token:
+
+- The token lives in a `0600` file at `<state_dir>/api-token` (default
+  `~/.local/state/slack-harvester/api-token`).
+- The harvester generates it (`secrets.token_urlsafe(32)`, mode `0600`) at
+  startup if the file is absent; an existing file is **never** overwritten, so
+  you can pre-seed your own token.
+- Callers pass `Authorization: Bearer <token>`; the comparison is constant-time.
+  A missing or wrong token returns `401` and **no Slack call is made**.
+
+**Allow-list (read-only only).** Exactly three methods are permitted; anything
+else returns `403` with no Slack call:
+
+- `conversations.history`
+- `conversations.replies`
+- `auth.test`
+
+**Usage.**
+
+```bash
+TOKEN=$(cat ~/.local/state/slack-harvester/api-token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:7777/slack?method=conversations.history&channel=D0AUM6S6HQS&latest=1784148148.166149&limit=16&inclusive=true' \
+  | python3 -m json.tool
+```
+
+The `method` query param selects the Slack method; every other query param is
+passed through to Slack unchanged.
+
+**Errors.** On a Slack-side error or bad request, the response is a structured
+JSON envelope (`{"ok": false, "error": ..., "has_credentials": <bool>, ...}`),
+not a stack trace. The `has_credentials` field lets a caller tell "creds
+expired" apart from "bad request".
+
+A sandbox-run caller resolves a different `$HOME` than the launchd harvester, so
+its `<state_dir>/api-token` differs. Always target the running harvester at
+`http://127.0.0.1:7777` and read the token from the harvester's real-`HOME`
+state dir — that's the file the running process compares against.
+
 ## Failure handling
 
 - **Capture-level failures** (opencode error, network drop mid-fetch, etc.) park raw JSON to `{capture_dir}/_pending/`. The dedup ledger entry is un-marked so the next poll retries automatically. Persistent failures stay parked; clean up manually after fixing the underlying issue.

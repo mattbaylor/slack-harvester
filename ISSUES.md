@@ -232,6 +232,59 @@ of error. Fix-forward; any pre-2026-07-13 capture with `<@…>` in its
 `reacted_message` frontmatter is a candidate for the same latent bug if
 ever re-examined.
 
+### #14 — 🟢 No sanctioned seam for agents to read Slack without touching Chrome (FIXED 2026-07-16)
+
+**Where:** `harvester.py:HarvestHandler.do_GET` (the loopback health server —
+previously `GET /health` only).
+**Symptom:** Local agent tooling (and Matt) had no sanctioned path to fetch a
+real read-only Slack API result — e.g. a `conversations.history` window to build
+a test fixture. The only credential path, `chrome_creds.py`, reads Chrome's
+LevelDB (`xoxc` token) and Cookies SQLite DB + macOS Keychain (`d` cookie), all
+under browser-profile paths that are EDR-watchlisted (MITRE T1539) and forbidden
+for the agent — touching them tripped a cybersec alert on 2026-06-29.
+**Cause:** The harvester already reads and holds fresh creds
+(`HarvesterState.token`/`.cookie`) and already runs a loopback HTTP server
+(`HarvestHandler`, bound `127.0.0.1:7777`), but that server exposed **only**
+`GET /health`. There was no seam for anything else to reuse the harvester's
+already-loaded creds, so the creds were trapped in the process — reachable only
+by re-reading Chrome, the forbidden path. Taking a dependency on
+`mcp-cookie-bridge` doesn't help (it can't get the `xoxc` token — that's not a
+cookie); instead we adopt the bridge's serve/freshness/loopback *pattern* in
+owned code.
+**Fix shipped:** Added one loopback-only, bearer-token-guarded route,
+`GET /slack?method=<m>&<passthrough params>`, to `HarvestHandler.do_GET`.
+1. **Auth.** Reads a `0600` bearer-token file at `<state_dir>/api-token`
+   (generated with `secrets.token_urlsafe(32)` at startup if absent, never
+   overwritten) and compares the `Authorization: Bearer <t>` header with
+   `hmac.compare_digest` (constant-time). Missing/wrong token → `401`, and no
+   Slack call is made.
+2. **Allow-list (read-only only).** Exactly `{conversations.history,
+   conversations.replies, auth.test}`. Anything else → `403`, no Slack call.
+3. **Proxy.** On an allowed + authed request, builds params from the query
+   string (everything except `method` passes through) and calls the existing
+   `SlackClient._call`, returning the raw Slack JSON with `200`. The creds
+   (`token`/`cookie`) are never serialized into any response.
+4. **Freshness envelope.** On a Slack-side or bad-request error, returns a
+   structured JSON error including a `has_credentials` hint (from
+   `state.has_credentials()`) — not a `500` stack trace — so a caller can tell
+   "creds expired" from "bad request".
+The handler logic (token check, allow-list, query parse, envelope build, proxy
+dispatch) is factored into plain module-level functions taking an injected
+`call_fn`, unit-tested hermetically in `tests/test_slack_proxy_seam.py` (no
+socket bind, no live Slack, no Chrome). Bind stays `127.0.0.1`; `/health` keys
+are unchanged. The `chrome_creds` import was made lazy so the module is
+importable for the hermetic tests without `cryptography` installed; runtime
+behavior is unchanged (the import still happens on the first credential read).
+**Advances but does not close:** the spirit of **#9c** (a `/health?probe=1`
+pipeline exercise can now reuse the `auth.test` allow-list entry) and **#6**
+(the `has_credentials` freshness hint in the `/slack` envelope makes an expired
+-creds failure distinguishable from a bad request). Both stay open — this adds
+the seam, not the healthcheck wiring or the verified 401-flip.
+**Not in scope:** a `/creds` endpoint returning raw token/cookie (explicitly
+rejected — the proxy hands data, not secrets); write/mutating Slack methods
+(read-only allow-list only); turning the seam into an MCP tool (curl/HTTP is
+enough for the fixture use case; noted for a future session).
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -256,6 +309,8 @@ ever re-examined.
 | 2 | #8 + asset capture | 🟢 Shipped 2026-06-10. Folder-per-capture layout + asset download + migration tools. Closed orphan dirs. |
 | 2b | #11 | 🟢 Shipped 2026-06-10. Recovery-sweep cloud-sync race guard (refuse if >20% orphan fraction). |
 | 2c | #12 | 🟢 Shipped 2026-06-15. Image download auth fix (`d` cookie) + HTML/magic-bytes guards. |
+| 2d | #13 | 🟢 Shipped 2026-07-13. Resolve `<@Uxxxx>` mentions in Python before opencode (stop name hallucination). |
+| 2e | #14 | 🟢 Shipped 2026-07-16. Loopback token-guarded read-only Slack proxy seam (`GET /slack`). Advances #9c/#6, both still open. |
 | 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |

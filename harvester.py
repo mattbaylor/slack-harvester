@@ -16,10 +16,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
+import os
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -27,11 +30,16 @@ import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlencode
+from typing import Callable, Optional
+from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import Request, urlopen
 
-from chrome_creds import read_credentials
+# NOTE: `chrome_creds` (and its `cryptography` dependency) is imported lazily
+# inside HarvesterState.refresh_credentials rather than at module load. This
+# keeps `harvester` importable for hermetic unit tests (e.g.
+# tests/test_slack_proxy_seam.py, which exercises the pure Slack-proxy helpers)
+# on machines without `cryptography` installed. Runtime behavior is unchanged:
+# the import still happens the first time credentials are read.
 
 # ---------------------------------------------------------------------------
 # Config
@@ -285,6 +293,9 @@ class HarvesterState:
 
     def refresh_credentials(self):
         """Read credentials from Chrome profile on disk."""
+        # Lazy import so the module stays importable for hermetic tests without
+        # the `cryptography` dependency (see note at top of file).
+        from chrome_creds import read_credentials
         with self._lock:
             try:
                 token, cookie = read_credentials(self.chrome_profile)
@@ -1500,22 +1511,189 @@ Return only the markdown body. Do not invoke any tools. Do not write to any file
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler (credentials + health only)
+# Loopback Slack proxy seam (ISSUES.md #14)
+#
+# A single bearer-token-guarded, loopback-only route that proxies an
+# allow-listed set of READ-ONLY Slack methods through the harvester's
+# already-loaded credentials, returning the raw Slack JSON. The creds NEVER
+# appear in any response body. This lets sanctioned local agent tooling fetch
+# read-only Slack data without any process but the harvester touching Chrome's
+# cookie/token store (the EDR-watchlisted path). Adopts the cookie-bridge's
+# serve / freshness / loopback pattern; owned code, no dependency on it.
+#
+# The handler logic below is factored into plain module-level functions so it
+# is unit-testable without binding a socket or hitting live Slack: the token
+# check, allow-list check, query parsing, and envelope building are all pure,
+# and the proxy dispatch takes an injected `call_fn` (the real handler passes
+# SlackClient._call). See tests/test_slack_proxy_seam.py.
+# ---------------------------------------------------------------------------
+
+# Read-only methods only. Anything not in this set is rejected with 403 before
+# any Slack call is made. Keep this tight — an open passthrough would be an
+# exfiltration surface (see plan Risks: "scope-creep into a general proxy").
+SLACK_PROXY_ALLOWED_METHODS = frozenset({
+    "conversations.history",
+    "conversations.replies",
+    "auth.test",
+})
+
+
+def api_token_path(state_dir: Path) -> Path:
+    """Path to the bearer-token file: <state_dir>/api-token."""
+    return Path(state_dir) / "api-token"
+
+
+def ensure_api_token(state_dir: Path) -> str:
+    """Return the loopback API token, generating a 0600 file if absent.
+
+    Generates `secrets.token_urlsafe(32)` and writes it mode 0600 if the file
+    does not exist. An existing file is NEVER overwritten — its contents are
+    returned verbatim (stripped of trailing whitespace). Called once at
+    startup; the returned value is what the handler compares incoming bearer
+    tokens against.
+    """
+    path = api_token_path(state_dir)
+    if path.exists():
+        return path.read_text().strip()
+    token = secrets.token_urlsafe(32)
+    # Create with 0600 from the start (open + os.open flags) so the token is
+    # never briefly world-readable. os.O_EXCL guards a startup race.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, token.encode())
+    finally:
+        os.close(fd)
+    return token
+
+
+def check_bearer_token(auth_header: Optional[str], expected_token: Optional[str]) -> bool:
+    """Constant-time bearer-token check.
+
+    Returns True only when `auth_header` is exactly "Bearer <t>" and <t>
+    matches `expected_token`. Uses hmac.compare_digest so the comparison time
+    does not leak how many leading characters matched. A missing header, a
+    malformed header, or a missing expected token all return False.
+    """
+    if not expected_token:
+        return False
+    if not auth_header:
+        return False
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        return False
+    presented = auth_header[len(prefix):]
+    return hmac.compare_digest(presented, expected_token)
+
+
+def parse_slack_query(path: str) -> tuple[Optional[str], dict]:
+    """Parse a /slack request path into (method, passthrough_params).
+
+    `method` is pulled from the query string; every other query param is passed
+    through to Slack unchanged. Repeated params collapse to their last value
+    (Slack read methods take scalar params). Returns (None, {}) if `method` is
+    absent.
+    """
+    query = urlparse(path).query
+    raw = parse_qs(query, keep_blank_values=True)
+    flat = {k: v[-1] for k, v in raw.items()}
+    method = flat.pop("method", None)
+    return method, flat
+
+
+def build_error_envelope(message: str, has_credentials: bool,
+                         slack_error: Optional[str] = None) -> dict:
+    """Structured JSON error envelope (never a stack trace / 500 crash).
+
+    Includes a credential-freshness hint (`has_credentials`) so a caller can
+    distinguish "creds expired" from "bad request" — the ambiguity ISSUES #6
+    flags. NEVER contains token/cookie; callers pass only a message and the
+    boolean freshness flag.
+    """
+    env = {
+        "ok": False,
+        "error": message,
+        "has_credentials": has_credentials,
+    }
+    if slack_error is not None:
+        env["slack_error"] = slack_error
+    return env
+
+
+def handle_slack_proxy(path: str, auth_header: Optional[str],
+                       expected_token: Optional[str],
+                       call_fn: Callable[[str, dict], dict],
+                       has_credentials: bool) -> tuple[int, dict]:
+    """Pure core of the /slack route — returns (http_status, body_dict).
+
+    Wiring order is security-first:
+      1. Bearer-token check (constant-time). Fail → 401, NO call_fn invoked.
+      2. Method allow-list check. Not listed → 403, NO call_fn invoked.
+      3. Dispatch call_fn(method, params); return raw Slack JSON with 200.
+      4. Any exception from call_fn → structured error envelope (200-shaped
+         error body is avoided; we return 502 for an upstream Slack failure and
+         400 for a missing method), never a stack trace.
+
+    `call_fn` is injected (SlackClient._call in production, a fake in tests) so
+    this function is fully hermetic — no socket, no network.
+    """
+    # 1. Auth first: no Slack call on an unauthenticated request.
+    if not check_bearer_token(auth_header, expected_token):
+        return 401, build_error_envelope("unauthorized", has_credentials)
+
+    method, params = parse_slack_query(path)
+
+    # A request that authed but named no method is a bad request, not a 403.
+    if not method:
+        return 400, build_error_envelope(
+            "missing required query param: method", has_credentials)
+
+    # 2. Allow-list: reject anything not read-only BEFORE any Slack call.
+    if method not in SLACK_PROXY_ALLOWED_METHODS:
+        return 403, build_error_envelope(
+            f"method not allowed: {method}", has_credentials)
+
+    # 3. Dispatch through the injected caller (real: SlackClient._call).
+    try:
+        data = call_fn(method, params)
+    except Exception as e:
+        # SlackClient._call raises RuntimeError("Slack API error: <error>")
+        # on an ok:false, and RuntimeError("No credentials") when unloaded.
+        # Surface a structured envelope, never a traceback.
+        return 502, build_error_envelope(
+            "slack call failed", has_credentials, slack_error=str(e))
+
+    # 4. Success — return the raw Slack JSON verbatim (contains no creds).
+    return 200, data
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler (credentials + health + read-only Slack proxy)
 # ---------------------------------------------------------------------------
 
 
 class HarvestHandler(BaseHTTPRequestHandler):
     state: HarvesterState
     worker: "CaptureWorker"
+    api_token: Optional[str] = None
 
     def do_GET(self):
-        if self.path == "/health":
+        route = urlparse(self.path).path
+        if route == "/health":
             self._respond(200, {
                 "status": "ok",
                 "has_credentials": self.state.has_credentials(),
                 "seen_count": len(self.state.seen),
                 "queue_depth": self.worker.queue.qsize(),
             })
+        elif route == "/slack":
+            status, body = handle_slack_proxy(
+                path=self.path,
+                auth_header=self.headers.get("Authorization"),
+                expected_token=self.api_token,
+                call_fn=self.worker.client._call,
+                has_credentials=self.state.has_credentials(),
+            )
+            self._respond(status, body)
         else:
             self._respond(404, {"error": "not found"})
 
@@ -1983,6 +2161,14 @@ def main():
 
     HarvestHandler.state = state
     HarvestHandler.worker = worker
+
+    # Loopback Slack proxy seam (ISSUES.md #14): generate the 0600 bearer-token
+    # file at <state_dir>/api-token if absent (never overwrite an existing one),
+    # and hand the token to the handler for constant-time comparison. This
+    # gates the /slack route so other local processes can't call it blind.
+    api_token = ensure_api_token(state.state_dir)
+    HarvestHandler.api_token = api_token
+    log.info("Slack proxy token file: %s (0600)", api_token_path(state.state_dir))
 
     # Recovery sweep (ISSUES.md #10): un-mark seen entries with no corresponding
     # capture file in the expected date dir. As of 2026-06-10 (ISSUES.md #11)
