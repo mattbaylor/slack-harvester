@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Slack Harvester Creds",
+  "version": "1.0.0",
+  "description": "Reads the live Slack session (xoxc token from localStorage + d cookie), keeps it warm, pushes credentials to the local Slack Harvester, and alerts on logout. Companion to slack-harvester (ISSUES #17).",
+  "permissions": [
+    "cookies",
+    "alarms",
+    "storage",
+    "scripting",
+    "notifications",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.slack.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

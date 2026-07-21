@@ -1,0 +1,5 @@
+{
+  "harvesterPort": 7777,
+  "refreshIntervalMinutes": 5,
+  "apiToken": "PASTE-YOUR-HARVESTER-API-TOKEN-HERE"
+}

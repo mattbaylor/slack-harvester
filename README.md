@@ -29,13 +29,12 @@ Slack (any client)
        └─ 02.pdf         (attached PDF, if any)
 ```
 
-Credentials are read directly from a Chrome profile on disk — no running browser, no extension, no Slack app install required. You sign into Slack in a dedicated Chrome profile once, and the harvester reads the session token and cookie from Chrome's local storage and cookie database.
+Credentials are pushed to the harvester by a companion Chrome extension (`extension/`) that reads your **live** Slack web session — the `xoxc` token from `localStorage` and the `d` cookie via `chrome.cookies` — keeps the session warm, and `POST`s the creds to a loopback endpoint. The harvester no longer scrapes the Chrome profile on disk (ISSUES #17). You sign into Slack web **once** in the browser where the extension is loaded; from then on the extension keeps the harvester authenticated and alerts you if you get logged out.
 
 ## Requirements
 
-- macOS (reads Chrome Keychain for cookie decryption)
 - Python 3.9+
-- Chrome (for one-time Slack sign-in)
+- Chrome (to load the companion extension and sign into Slack web once)
 - [opencode](https://opencode.ai) CLI
 
 ## Setup
@@ -48,10 +47,11 @@ cd slack-harvester
 
 `setup.sh` walks you through:
 
-1. Installing Python dependencies (`cryptography`)
+1. Installing Python dependencies
 2. Creating `config.json` (workspace URL, vault path, capture directory)
-3. Opening Chrome for a one-time Slack sign-in
-4. Verifying credentials are readable
+3. Loading the companion extension and handing it the harvester's loopback api-token
+
+Then, once, in Chrome: load the unpacked extension from `extension/` (`chrome://extensions` → Developer mode → Load unpacked), sign into Slack web (`https://app.slack.com/`), copy `extension/config.example.json` to `extension/config.json`, and paste the harvester's api-token (from `<state_dir>/api-token`) into its `apiToken` field.
 
 ## Run
 
@@ -155,10 +155,10 @@ Copy `config.example.json` to `config.json` and edit (or let `setup.sh` do it):
 
 | Field | Description |
 |---|---|
-| `workspace_url` | Your Slack workspace URL. Used during setup for the Chrome sign-in. |
+| `workspace_url` | Your Slack workspace URL. Used during setup. |
 | `vault_path` | Root of your Obsidian vault (or any directory). |
 | `capture_dir` | Directory name inside the vault for captures. Created automatically. |
-| `chrome_profile` | Path to the dedicated Chrome profile. Don't use your daily profile. |
+| `chrome_profile` | **Deprecated (ISSUES #17).** No longer read — creds are pushed by the extension. Retained for backward compat; safe to delete. |
 | `poll_interval` | Seconds between polls. 60 is fine; this isn't latency-sensitive. |
 | `reactions` | Emoji names (without colons) that trigger a capture. Use whatever feels natural. |
 | `opencode_command` | Path or name of the opencode CLI binary. |
@@ -240,12 +240,21 @@ Idempotent — running it with no pending files exits cleanly. Exits rc=2 if Sla
 
 ## How credentials work
 
-The harvester reads Slack's `xoxc` session token from Chrome's `localStorage` LevelDB and the `d` cookie from Chrome's `Cookies` SQLite database. Both are stored in the dedicated Chrome profile you created during setup.
+Credentials are **pushed** to the harvester by the companion Chrome extension (`extension/`), which reads your live Slack web session and `POST`s `{token, cookie}` to a loopback endpoint (ISSUES #17). The harvester never scrapes Chrome's disk.
 
-- **Token**: Unencrypted in LevelDB. Extracted via binary regex — no LevelDB library needed.
-- **Cookie**: AES-CBC encrypted. Decrypted using Chrome's key from the macOS Keychain (`Chrome Safe Storage`).
-- **No Chrome process needed** after initial sign-in. Credentials persist on disk.
-- **Token rotation**: If the token expires, sign into Slack again in the dedicated Chrome profile. The harvester picks up the new credentials on the next poll.
+- **Extension reads the live session**: the `xoxc` token from Slack web's `localStorage` (`localConfig_v2`) via `chrome.scripting`, and the `d` cookie via `chrome.cookies.getAll({domain: '.slack.com'})`.
+- **Push**: on a periodic alarm (`refreshIntervalMinutes`, default 5) and on cookie change, the extension `POST`s to `http://127.0.0.1:<port>/creds` with `Authorization: Bearer <api-token>` (the same loopback token as the `/slack` seam). The harvester validates and stores the creds in memory (and persists them 0600 to `<state_dir>/creds.json` so a restart has creds before the next push).
+- **Keep-warm**: the extension manages a Slack web tab so the session stays alive and the token stays fresh — the mechanism proven in the SQ1/SQ2 prototype.
+- **Logout alert**: if the token can't be read (you're logged out / the session ended), the extension fires a Chrome notification telling you to re-sign-in, and the popup shows the logged-out state. Capture pauses (no silent multi-hour gap) until you sign back in.
+- **No `cryptography` / no Keychain / no LevelDB / no EDR-watchlisted browser-profile reads** — the whole disk-scrape fragility class is gone. `chrome_creds.py` is retired from the runtime (kept only as reference).
+
+### POST /creds ingest
+
+The extension authenticates with the loopback bearer token and posts a JSON body `{ "token": "xoxc-…", "cookie": "…" }`:
+
+- Missing/wrong bearer → `401`, no creds set.
+- Malformed / empty body, or a missing/blank `token`/`cookie` → `400`, no creds set (never a partial set, never a crash).
+- Valid → the harvester sets the creds under lock and returns `200 {"ok": true}`. The token/cookie values are **never** logged (only their lengths) and **never** returned in any response.
 
 ## Read-only Slack proxy seam
 
@@ -255,12 +264,10 @@ harvester has already loaded — and returns the raw Slack JSON.
 
 **Why this exists.** Sanctioned local agent tooling (and you) sometimes need a
 real Slack API result — e.g. a `conversations.history` window to build a test
-fixture. The only credential path is `chrome_creds.py`, which reads Chrome's
-cookie/token store under browser-profile paths that are EDR-watchlisted and
-off-limits to agents. This seam lets the harvester — whose Chrome-reading is its
-accepted job — make the call, so the caller only ever sees JSON. **The
-credentials never cross the wire.** The endpoint proxies calls; it never returns
-the `token` or `cookie`.
+fixture. This seam lets the harvester — which already holds live pushed creds —
+make the call, so the caller only ever sees JSON. **The credentials never cross
+the wire.** The endpoint proxies calls; it never returns the `token` or
+`cookie`.
 
 **Auth.** The route is bound to `127.0.0.1` only and gated by a bearer token:
 
@@ -272,12 +279,16 @@ the `token` or `cookie`.
 - Callers pass `Authorization: Bearer <token>`; the comparison is constant-time.
   A missing or wrong token returns `401` and **no Slack call is made**.
 
-**Allow-list (read-only only).** Exactly three methods are permitted; anything
-else returns `403` with no Slack call:
+**Allow-list (read-only only).** Only these read-only methods are permitted;
+anything else (write/mutating) returns `403` with no Slack call:
 
 - `conversations.history`
 - `conversations.replies`
 - `auth.test`
+- `search.messages`
+- `reactions.list`
+- `reactions.get`
+- `users.conversations`
 
 **Usage.**
 
@@ -307,13 +318,14 @@ state dir — that's the file the running process compares against.
 - **Asset-level failures** (one or more attached files won't download) park to `{capture_dir}/YYYY-MM-DD/{slug}/_pending-images.json`. The capture itself ships. Retry with `python3 harvester.py --retry-pending`. See "Attached files" above.
 - **Silent losses** (entries in `seen.json` with no matching capture file on disk) are detected by the recovery sweep at startup but are NOT auto-recovered (avoids spurious duplicates from cloud-sync races; see ISSUES.md #11). After confirming the filesystem is in steady state (e.g. GoogleDrive synced), run `python3 harvester.py --recover` (or `--recover --dry-run` to preview) to un-mark the orphans so the next poll re-processes them.
 - Slack rate limits are handled with `Retry-After` backoff.
-- Auth failures trigger an automatic credential re-read from the Chrome profile.
+- Auth failures (`invalid_auth`) clear the stale creds and idle-wait for the extension to push fresh ones (no disk-scrape). If you've been logged out, the extension fires a logout notification.
 
 ## Limitations
 
-- **macOS only** — cookie decryption depends on the macOS Keychain. Linux would need a different decryption path.
-- **`xoxc` token scope** — some Slack API methods don't work with session tokens. The harvester uses `search.messages` (which works) instead of `reactions.list` (which doesn't).
+- **Cross-platform harvester, Chrome-bound extension** — the harvester itself no longer depends on the macOS Keychain (the disk-scrape path is retired). The companion extension needs Chrome (any OS) signed into Slack web.
+- **`xoxc` token scope** — some Slack API methods don't work with session tokens. The harvester uses `search.messages` (which works) instead of `reactions.list` (which doesn't) for the poller.
 - **One workspace** — the config supports a single workspace. For multiple workspaces, run separate instances with separate configs.
+- **Keep-warm horizon** — the SQ2 prototype proved short-horizon keep-warm (~49 min); the overnight-untended case is verified by the logout alert (O2) rather than guaranteed to never expire. See ISSUES #17.
 
 ## Known issues and design notes
 

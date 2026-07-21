@@ -341,6 +341,82 @@ per #12/#13); the real-window fixture fetch through the #14 seam (deferred —
 this ships with the synthetic fixture, MECHANISM-proven; O1 uplifts to
 OUTCOME-proven after a seam fetch).
 
+### #17 — 🟢 Ephemeral xoxc dies overnight; disk-scrape is fragile + EDR-watchlisted (FIXED 2026-07-21, live-verify owed)
+
+**Where:** `chrome_creds.py:read_credentials` (retired) and the whole
+credential-source path (`harvester.py:HarvesterState`, `ReactionPoller._run`,
+`main`). New companion Chrome extension at `extension/`.
+**Symptom:** Capture repeatedly, silently stops with `invalid_auth` (seen
+2026-07-15→18: 07/17 15:33, 07/17 post-15:52 held only hours, 07/18 06:29 dead
+again). Root cause proven: the harvester scraped an **ephemeral `xoxc` browser
+token** from a Chrome profile that wasn't kept logged in; Slack expires it
+(hours→overnight), so capture died until a manual re-sign-in. The disk-scrape
+(`chrome_creds.py`) also touched EDR-watchlisted browser-profile paths (MITRE
+T1539) and had a LevelDB-lock / Keychain-decrypt fragility class.
+**Cause:** `xoxc` is a browser-**session** token Slack expires when the session
+isn't kept active. Reading it off disk (a) reads a possibly-stale/expired token
+with no way to know it's dead until Slack 401s, (b) can race the LevelDB lock,
+(c) needs the macOS Keychain to decrypt the `d` cookie, and (d) touches
+forbidden browser-profile paths. Nothing kept the session warm and nothing
+alerted on a real logout — capture just went silent.
+**Fix shipped:** Push model. A purpose-built MV3 Chrome extension (`extension/`,
+standalone — NOT a `mcp-cookie-bridge` fork) runs inside Chrome on
+`*.slack.com`, reads the **live** session (`xoxc` from `localStorage`
+`localConfig_v2` via `chrome.scripting`; `d` via `chrome.cookies`), keeps the
+session warm on an alarm (default 5 min), and `POST`s `{token, cookie}` to a new
+harvester loopback route.
+1. **`POST /creds` ingest** (`HarvestHandler.do_POST`, route `/creds` only;
+   else 404/405). Pure core `handle_creds_ingest(auth_header, expected_token,
+   raw_body) -> (status, body, creds_or_None)` mirrors the #14 seam's
+   security-first wiring: constant-time bearer check (reuses
+   `check_bearer_token`) → 401 no creds; defensive JSON parse → malformed/empty/
+   non-object → 400 no creds; require non-empty string `token`+`cookie` → else
+   400 no creds; valid → 200 `{ok:true}` and the creds are set under
+   `state._lock` (`set_credentials`). Token/cookie values are **never** logged
+   (lengths only) and **never** returned. Hermetic tests in
+   `tests/test_creds_ingest.py`.
+2. **Cred-source cutover.** `refresh_credentials` is now a passive no-op that
+   NULLS creds (the poller's `invalid_auth` recovery path calls it to clear +
+   idle-wait for the next push — no disk-scrape). Startup no longer disk-reads;
+   it loads last-pushed creds from a `0600` `<state_dir>/creds.json` if present
+   (so a restart has creds before the next push) else starts credless and
+   idle-waits. The Chrome-profile-missing startup hard-exit is removed
+   (`chrome_profile` is a legacy config field, never accessed).
+3. **Retire `chrome_creds` from runtime.** No runtime `read_credentials` call,
+   no `chrome_creds` import anywhere (grep-clean). The module is kept as
+   reference/fallback with a header note. `harvester.py` now imports without the
+   `cryptography` dependency.
+4. **Extension** (`extension/`): `manifest.json` (MV3, permissions
+   `cookies/alarms/storage/scripting/notifications/tabs`, host_permissions
+   `https://*.slack.com/*` + `http://127.0.0.1/*`), `background.js` (managed
+   Slack tab keep-warm, read + push + logout notification), `popup.html/js`
+   (logged-in state, last successful push time, last push result ok/401/
+   unreachable, manual "Push now", logout note), `config.example.json`
+   (`harvesterPort`/`refreshIntervalMinutes`/`apiToken`; `config.json`
+   gitignored — holds the token), placeholder icons.
+5. **Touchpoints updated:** `setup.sh` (extension-install + api-token handoff
+   instead of open-Chrome/sign-in/close + chrome_creds verify), `healthcheck.sh`
+   (liveness reads `/health has_credentials`; no chrome_creds; down-alert is a
+   macOS notification), `config.example.json` (deprecate `chrome_profile`),
+   `.gitignore` (ignore `creds.json`), `README.md` (new cred model).
+**Prototype gate PASSED (2026-07-21):** SQ1 (xoxc from localStorage) ✅ proven;
+SQ2 (keep-warm) ✅ passed to Matt's pragmatic bar (11 LIVE probes over 49 min).
+See the plan's "Test results" for the caveat (49 min ≠ overnight-untended).
+**Live-verify owed (needs Matt to load the extension):** O1 multi-hour soak
+(sustained auth across an xoxc rotation with no manual sign-in) and O2 (logout
+fires the alert within one refresh cycle) require the real extension loaded in
+Matt's Chrome + a signed-in Slack web tab. O3 (grep-clean cred source; boots
+credless; first push flips `has_credentials:true`) is code-verified here; the
+"first push flips it" half needs the live extension.
+**Supersedes / advances:** retires the `chrome_creds` cred-fragility class
+behind **#6** (auth-failure now clears + waits for a fresh push rather than
+re-scraping a possibly-stale profile) and **#9a/#9b/#9c** (no Chrome profile
+lock, no sandbox-coupled profile path, liveness off `/health`). Those entries
+stay open only for their non-cred aspects.
+**Not in scope:** a Slack OAuth app (xoxb/xoxp — bigger, needs workspace admin);
+auto-relogin (the extension alerts, Matt re-signs-in); Plan C (#16 resilience,
+stacks on top after creds are stable).
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -368,7 +444,8 @@ OUTCOME-proven after a seam fetch).
 | 2d | #13 | 🟢 Shipped 2026-07-13. Resolve `<@Uxxxx>` mentions in Python before opencode (stop name hallucination). |
 | 2e | #14 | 🟢 Shipped 2026-07-16. Loopback token-guarded read-only Slack proxy seam (`GET /slack`). Advances #9c/#6, both still open. |
 | 2f | #15 | 🟢 Shipped 2026-07-16. Time-gap segmentation bounds channel context to the anchor's conversational burst; prompt boundary rule + config knob (`context_max_gap_hours`, default 6h). First hermetic test. |
-| 3 | #9b | 🔴 Next. Move chrome profile out of sandbox-coupled path. |
+| 2g | #17 | 🟢 Shipped 2026-07-21 (live-verify owed). Push-model creds: companion Chrome extension reads the live session + keeps warm + alerts on logout, `POST /creds` ingest (bearer-authed, locked, validated, persisted 0600), chrome_creds retired from runtime. Retires the cred-fragility class behind #6/#9a/#9b/#9c. O1 soak + O2 logout alert need Matt to load the extension. |
+| 3 | #9b | ⚪ Largely mooted by #17 (no Chrome profile to sandbox-couple). |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |
 | 6 | #4 | 🔴 Pin model. |
