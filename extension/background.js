@@ -62,14 +62,30 @@ async function findSlackTab() {
 }
 
 // Ensure a Slack tab exists so the session stays warm and the token is
-// readable. Creates one (unfocused, in the background) if none is open. This
-// is the "managed tab" the prototype flagged as needed — we don't just hope a
-// tab is open. Returns the tab or null if creation failed.
+// readable. The tab is kept PINNED and unfocused so it's nearly invisible
+// (favicon-only, far left, hard to close by accident) and never steals focus.
+// A live Slack PAGE is unavoidable — the xoxc token lives in the page's
+// localStorage and is only readable via chrome.scripting against a real tab —
+// so "hidden" means pinned-and-backgrounded, not eliminated. Returns the tab
+// or null if creation failed.
 async function ensureSlackTab() {
   let tab = await findSlackTab();
-  if (tab) return tab;
+  if (tab) {
+    // Tuck away any pre-existing (e.g. manually opened, unpinned) Slack tab so
+    // it stops cluttering the tab strip. Never focus it.
+    if (!tab.pinned) {
+      try {
+        tab = await chrome.tabs.update(tab.id, { pinned: true });
+      } catch (e) {
+        // Non-fatal: an unpinned tab still works for reads.
+        console.warn("Slack Harvester Creds: could not pin existing Slack tab:", e.message);
+      }
+    }
+    return tab;
+  }
   try {
-    tab = await chrome.tabs.create({ url: SLACK_TAB_URL, active: false });
+    // Create it pinned + inactive from the start so it never flashes into view.
+    tab = await chrome.tabs.create({ url: SLACK_TAB_URL, active: false, pinned: true });
     // Give the page a moment to load its localStorage before the first read.
     // Subsequent alarm cycles will find it already warm.
     return tab;
