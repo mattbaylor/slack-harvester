@@ -7,12 +7,11 @@
 
 set -euo pipefail
 
-# Ensure cryptography package is importable for chrome_creds.py.
-# Set HARVESTER_PYTHONPATH in the launchd plist (or your shell) if your
-# Python install needs a non-default site-packages on PYTHONPATH.
-if [ -n "${HARVESTER_PYTHONPATH:-}" ]; then
-    export PYTHONPATH="${PYTHONPATH:-}:${HARVESTER_PYTHONPATH}"
-fi
+# Credentials are pushed by the extension (ISSUES #17); this script no longer
+# imports chrome_creds and does not need `cryptography` on PYTHONPATH. Liveness
+# is read straight off the harvester's /health endpoint (has_credentials), and
+# the alert is delivered via macOS notification (the harvester DMs itself on
+# its own failure paths using its in-memory pushed creds).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.json"
@@ -74,74 +73,12 @@ if $healthy; then
     exit 0
 fi
 
-# --- Alert: send Slack DM ---
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="$SCRIPT_DIR/config.json"
-
-# Read Chrome profile path and credentials
-chrome_profile=$(python3 - "$SCRIPT_DIR" "$CONFIG" << 'PYEOF'
-import json, os, sys
-script_dir, config_path = sys.argv[1], sys.argv[2]
-sys.path.insert(0, script_dir)
-c = json.load(open(config_path))
-print(os.path.expanduser(c['chrome_profile']))
-PYEOF
-) || chrome_profile=""
-
-if [ -n "$chrome_profile" ]; then
-    creds=$(python3 - "$SCRIPT_DIR" "$chrome_profile" << 'PYEOF'
-import sys, os
-sys.path.insert(0, sys.argv[1])
-from chrome_creds import read_credentials
-from pathlib import Path
-token, cookie = read_credentials(Path(sys.argv[2]))
-if token and cookie:
-    print(token)
-    print(cookie)
-PYEOF
-) || creds=""
-
-    if [ -n "$creds" ]; then
-        token=$(echo "$creds" | head -1)
-        cookie=$(echo "$creds" | tail -1)
-
-        # Get our own user ID
-        user_id=$(curl -s -m 10 \
-            -H "Authorization: Bearer $token" \
-            -H "Cookie: d=$cookie" \
-            -d "" \
-            "https://slack.com/api/auth.test" 2>/dev/null \
-            | python3 -c "import sys,json; print(json.load(sys.stdin).get('user_id',''))" 2>/dev/null || echo "")
-
-        if [ -n "$user_id" ]; then
-            # Open a DM channel to ourselves
-            dm_channel=$(curl -s -m 10 \
-                -H "Authorization: Bearer $token" \
-                -H "Cookie: d=$cookie" \
-                -H "Content-Type: application/x-www-form-urlencoded" \
-                -d "users=$user_id" \
-                "https://slack.com/api/conversations.open" 2>/dev/null \
-                | python3 -c "import sys,json; print(json.load(sys.stdin).get('channel',{}).get('id',''))" 2>/dev/null || echo "")
-
-            if [ -n "$dm_channel" ]; then
-                msg=":rotating_light: *Slack Harvester is down*\n\n$reason\n\nCheck: \`tail -50 /private/tmp/harvester.log\`\nRestart: \`launchctl kickstart gui/\$(id -u)/$HARVESTER_LABEL\`"
-
-                curl -s -m 10 \
-                    -H "Authorization: Bearer $token" \
-                    -H "Cookie: d=$cookie" \
-                    -H "Content-Type: application/x-www-form-urlencoded" \
-                    -d "channel=$dm_channel" \
-                    --data-urlencode "text=$msg" \
-                    "https://slack.com/api/chat.postMessage" >/dev/null 2>&1
-
-                # Record alert time for cooldown
-                date +%s > "$ALERT_COOLDOWN_FILE"
-                exit 0
-            fi
-        fi
-    fi
-fi
-
-# --- Fallback: macOS notification ---
+# --- Alert: macOS notification ---
+# Under the push model (ISSUES #17) this script does NOT hold Slack creds — it
+# no longer scrapes Chrome, and when the harvester is unreachable/credless
+# there is no loopback path to send a Slack DM. So the down-alert is a local
+# macOS notification. (The harvester itself DMs on its own failure paths via
+# _dm_self using its in-memory pushed creds, e.g. the startup self-test; and
+# the extension fires its own logout notification — ISSUES #17 O2.)
 osascript -e "display notification \"$reason\" with title \"Slack Harvester Down\"" 2>/dev/null || true
 date +%s > "$ALERT_COOLDOWN_FILE"

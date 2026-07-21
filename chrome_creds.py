@@ -4,6 +4,16 @@ No Chrome process or extension needed.
 
 Token: extracted from localStorage LevelDB files (unencrypted)
 Cookie: decrypted from Chrome's Cookies SQLite DB using macOS Keychain
+
+RETIRED FROM THE LIVE PATH (ISSUES #17, 2026-07-21). The harvester no longer
+imports this module at runtime — credentials now arrive by push (POST /creds)
+from a companion Chrome extension that reads the LIVE Slack session
+(localStorage xoxc + chrome.cookies d), keeps it warm, and alerts on logout.
+This disk-scrape approach touched EDR-watchlisted browser-profile paths
+(MITRE T1539) and had a LevelDB-lock / expired-token fragility class that the
+push model eliminates. This file is kept as reference and a possible manual
+fallback ONLY; nothing in harvester.py imports it. Do not re-wire it into the
+runtime without revisiting that decision.
 """
 
 from __future__ import annotations

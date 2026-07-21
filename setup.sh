@@ -3,8 +3,13 @@
 # Run this once per machine. It will:
 #   1. Install Python dependencies
 #   2. Create a config.json from the example
-#   3. Open Chrome with a dedicated profile so you can sign into Slack
-#   4. Verify credentials are readable
+#   3. Print the loopback api-token and next steps for the browser extension
+#
+# Credentials are NO LONGER scraped from Chrome (ISSUES #17). They are pushed
+# to the harvester by a companion Chrome extension (extension/) that reads the
+# LIVE Slack session and keeps it warm. Sign-in happens ONCE in the browser
+# where you load that extension; there is no dedicated harvester Chrome profile
+# to manage anymore.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,18 +20,20 @@ echo "=== Slack Harvester Setup ==="
 echo ""
 
 # --- Step 1: Python deps -------------------------------------------------
-echo "[1/4] Installing Python dependencies..."
+# NOTE: `cryptography` is no longer required at runtime (chrome_creds is
+# retired from the live path, ISSUES #17). requirements.txt install is kept
+# for any remaining deps; a failure here is non-fatal for the push model.
+echo "[1/3] Installing Python dependencies..."
 pip3 install -r "$SCRIPT_DIR/requirements.txt" --quiet 2>/dev/null || {
-    echo "  pip3 install failed. You may need: pip3 install cryptography"
-    exit 1
+    echo "  pip3 install failed (non-fatal for the push model). Continuing."
 }
 echo "  Done."
 
 # --- Step 2: Config -------------------------------------------------------
 if [ -f "$CONFIG" ]; then
-    echo "[2/4] config.json already exists, skipping."
+    echo "[2/3] config.json already exists, skipping."
 else
-    echo "[2/4] Creating config.json..."
+    echo "[2/3] Creating config.json..."
     echo ""
 
     read -rp "  Slack workspace URL (e.g. https://mycompany.slack.com/): " workspace_url
@@ -51,91 +58,6 @@ print('  Wrote', '$CONFIG')
 "
 fi
 
-# --- Step 3: Chrome sign-in -----------------------------------------------
-CHROME_PROFILE=$(python3 -c "
-import json, os
-c = json.load(open('$CONFIG'))
-print(os.path.expanduser(c['chrome_profile']))
-")
-WORKSPACE_URL=$(python3 -c "
-import json; print(json.load(open('$CONFIG'))['workspace_url'])
-")
-
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-if [ ! -x "$CHROME" ]; then
-    CHROME="$(command -v google-chrome || command -v google-chrome-stable || echo "")"
-fi
-
-if [ -z "$CHROME" ]; then
-    echo ""
-    echo "ERROR: Chrome not found. Install Chrome, then re-run this script."
-    exit 1
-fi
-
-echo ""
-echo "[3/4] Opening Chrome for Slack sign-in..."
-echo "  Profile: $CHROME_PROFILE"
-echo "  URL:     $WORKSPACE_URL"
-echo ""
-echo "  Sign into Slack in the Chrome window that opens."
-echo "  Once you see your Slack workspace loaded, close Chrome and come back here."
-echo ""
-read -rp "  Press Enter to open Chrome..."
-
-"$CHROME" \
-    --user-data-dir="$CHROME_PROFILE" \
-    --no-first-run \
-    --disable-notifications \
-    "$WORKSPACE_URL" 2>/dev/null &
-
-CHROME_PID=$!
-
-echo ""
-echo "  Chrome is open (PID: $CHROME_PID)."
-echo "  Sign in, wait for Slack to fully load, then close Chrome."
-echo ""
-read -rp "  Press Enter after you've signed in and closed Chrome..."
-
-# Kill Chrome if still running
-kill "$CHROME_PID" 2>/dev/null || true
-sleep 1
-
-# --- Step 4: Verify -------------------------------------------------------
-echo ""
-echo "[4/4] Verifying credentials..."
-
-VAULT_PATH=$(python3 -c "
-import json, os
-c = json.load(open('$CONFIG'))
-print(os.path.expanduser(c['vault_path']))
-")
-
-python3 -c "
-import sys, os, json
-sys.path.insert(0, '$SCRIPT_DIR')
-from chrome_creds import read_credentials
-from pathlib import Path
-
-config = json.load(open('$CONFIG'))
-profile = Path(os.path.expanduser(config['chrome_profile']))
-token, cookie = read_credentials(profile)
-
-if token and cookie:
-    print(f'  Token:  OK ({len(token)} chars)')
-    print(f'  Cookie: OK ({len(cookie)} chars)')
-    print()
-    print('Setup complete! Run the harvester with:')
-    print(f'  python3 $SCRIPT_DIR/harvester.py')
-else:
-    print('  ERROR: Could not read credentials.')
-    print('  Make sure you signed into Slack and the page fully loaded.')
-    print('  Re-run this script to try again.')
-    sys.exit(1)
-" || {
-    echo "  Credential verification failed."
-    exit 1
-}
-
 # Create capture directories
 CAPTURE_DIR=$(python3 -c "
 import json, os
@@ -144,5 +66,43 @@ vault = os.path.expanduser(c['vault_path'])
 print(os.path.join(vault, c['capture_dir']))
 ")
 mkdir -p "$CAPTURE_DIR/_pending" "$CAPTURE_DIR/_state" 2>/dev/null || true
-echo ""
 echo "  Vault capture directory: $CAPTURE_DIR"
+
+# --- Step 3: Extension handoff -------------------------------------------
+STATE_DIR=$(python3 -c "
+import json, os
+c = json.load(open('$CONFIG'))
+print(os.path.expanduser(c.get('state_dir', '~/.local/state/slack-harvester')))
+")
+API_TOKEN_FILE="$STATE_DIR/api-token"
+
+echo ""
+echo "[3/3] Browser extension handoff"
+echo ""
+echo "  The harvester now receives credentials from the companion extension in"
+echo "  '$SCRIPT_DIR/extension/'. To finish setup:"
+echo ""
+echo "  1. Start the harvester once so it generates its loopback api-token:"
+echo "         python3 $SCRIPT_DIR/harvester.py"
+echo "     (It will start with no credentials and idle-wait for the first push.)"
+echo ""
+echo "  2. In Chrome, load the unpacked extension:"
+echo "         chrome://extensions  ->  Developer mode  ->  Load unpacked"
+echo "         ->  select  $SCRIPT_DIR/extension"
+echo ""
+echo "  3. Sign into Slack WEB once in that Chrome"
+echo "     (https://app.slack.com/ — the extension reads the LIVE session)."
+echo ""
+echo "  4. Copy config.example.json to config.json inside the extension dir and"
+echo "     paste the harvester's api-token into its \"apiToken\" field."
+echo ""
+if [ -f "$API_TOKEN_FILE" ]; then
+    echo "     Your api-token (from $API_TOKEN_FILE):"
+    echo "         $(cat "$API_TOKEN_FILE")"
+else
+    echo "     The api-token file does not exist yet. Run the harvester once"
+    echo "     (step 1), then read it from: $API_TOKEN_FILE"
+fi
+echo ""
+echo "  Setup complete. The extension will push creds on its refresh alarm and"
+echo "  '/health' will flip has_credentials:true after the first successful push."

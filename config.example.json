@@ -2,6 +2,7 @@
   "workspace_url": "https://YOUR-WORKSPACE.slack.com/",
   "vault_path": "~/vault",
   "capture_dir": "slack-captures",
+  "_comment_chrome_profile": "DEPRECATED (ISSUES #17): the harvester no longer scrapes Chrome. Credentials are pushed by the companion extension (POST /creds). This field is read for backward compat only and its path is never accessed; you can delete it.",
   "chrome_profile": "~/.slack-harvest-profile",
   "poll_interval": 60,
   "reactions": [

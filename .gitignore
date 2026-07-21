@@ -10,6 +10,8 @@ _pending/
 seen.json
 *-cache.json
 token.json
+# Pushed creds persistence (0600, in state_dir) — never commit (ISSUES #17)
+creds.json
 
 # Real Slack windows fetched from the API may contain personal DM content —
 # keep those out of git. Synthetic/hand-built fixtures (e.g.

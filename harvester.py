@@ -5,7 +5,8 @@ Slack Harvester — Polling-based capture.
 Polls Slack's search API for messages you've reacted to with trigger emojis,
 fetches message context, and hands the bundle to opencode for vault capture.
 
-Reads credentials directly from a Chrome profile on disk — no extension needed.
+Credentials arrive by push (POST /creds) from a companion Chrome extension
+(ISSUES #17) — the harvester no longer scrapes the Chrome profile on disk.
 
 Usage:
     python harvester.py                     # uses config.json in same directory
@@ -34,12 +35,12 @@ from typing import Callable, Optional
 from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import Request, urlopen
 
-# NOTE: `chrome_creds` (and its `cryptography` dependency) is imported lazily
-# inside HarvesterState.refresh_credentials rather than at module load. This
-# keeps `harvester` importable for hermetic unit tests (e.g.
-# tests/test_slack_proxy_seam.py, which exercises the pure Slack-proxy helpers)
-# on machines without `cryptography` installed. Runtime behavior is unchanged:
-# the import still happens the first time credentials are read.
+# NOTE: `chrome_creds` is NO LONGER imported at runtime (ISSUES #17). The
+# credential source is now the extension push (POST /creds); the harvester
+# does not scrape the Chrome profile on disk. The chrome_creds.py module is
+# kept in the repo as reference / possible manual fallback but nothing here
+# imports it. Consequently `harvester` imports cleanly without the
+# `cryptography` dependency.
 
 # ---------------------------------------------------------------------------
 # Config
@@ -227,8 +228,13 @@ class HarvesterState:
         self.users: dict = self._load_json(self.users_cache_path, {})
         self.channels: dict = self._load_json(self.channels_cache_path, {})
 
-        # Load credentials from Chrome profile
-        self.refresh_credentials()
+        # Credentials arrive by push from the extension (ISSUES #17), not from
+        # a Chrome disk-scrape. On startup, load the last-pushed creds from a
+        # 0600 persistence file if one exists, so a harvester restart has creds
+        # before the next push (avoids a capture gap). If none exist we start
+        # with no creds and idle-wait for the first push (poller tolerates this).
+        self.creds_path = self.state_dir / "creds.json"
+        self.load_persisted_credentials()
 
     @staticmethod
     def _load_json(path: Path, default):
@@ -388,38 +394,83 @@ class HarvesterState:
         return orphans
 
     def refresh_credentials(self):
-        """Read credentials from Chrome profile on disk."""
-        # Lazy import so the module stays importable for hermetic tests without
-        # the `cryptography` dependency (see note at top of file).
-        from chrome_creds import read_credentials
+        """Passive no-op — creds now arrive via POST /creds push (ISSUES #17).
+
+        The harvester no longer scrapes the Chrome profile on disk. This method
+        remains as a named seam for the poller's invalid_auth recovery path
+        (harvester.py) and any legacy call site: on an auth failure we null the
+        stale creds and idle-wait for the extension to push fresh ones. It does
+        NOT read Chrome and does NOT block.
+        """
         with self._lock:
-            try:
-                token, cookie = read_credentials(self.chrome_profile)
-                if token and cookie:
-                    self.token = token
-                    self.cookie = cookie
-                    log.info("Credentials loaded from Chrome profile (token: %d chars, cookie: %d chars)",
-                             len(token), len(cookie))
-                elif token:
-                    self.token = token
-                    log.warning("Token loaded but cookie not found")
-                else:
-                    log.warning("No credentials found in Chrome profile at %s", self.chrome_profile)
-            except Exception as e:
-                log.error("Failed to read Chrome credentials: %s", e)
+            self.token = None
+            self.cookie = None
+        log.info("Credentials cleared; waiting for pushed creds from the extension")
 
     def has_credentials(self) -> bool:
         return bool(self.token and self.cookie)
 
+    def load_persisted_credentials(self):
+        """Load last-pushed creds from the 0600 creds.json file if present.
+
+        Called once at startup so a harvester restart has creds before the next
+        push. Missing/malformed file -> start with no creds (idle-wait). NEVER
+        logs the values, only lengths.
+        """
+        if not self.creds_path.exists():
+            log.info("No persisted credentials; waiting for first push from the extension")
+            return
+        try:
+            data = json.loads(self.creds_path.read_text())
+            token = data.get("token")
+            cookie = data.get("cookie")
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("Could not read persisted credentials at %s: %s",
+                        self.creds_path, e)
+            return
+        if isinstance(token, str) and isinstance(cookie, str) and token and cookie:
+            with self._lock:
+                self.token = token
+                self.cookie = cookie
+            log.info("Loaded persisted credentials (token: %d chars, cookie: %d chars); "
+                     "will be refreshed on next push", len(token), len(cookie))
+        else:
+            log.warning("Persisted credentials at %s incomplete; waiting for push",
+                        self.creds_path)
+
+    def _persist_credentials(self, token: str, cookie: str):
+        """Write the current creds to the 0600 creds.json file (atomic).
+
+        Best-effort: a persistence failure is logged but does not fail the push
+        (the in-memory creds are already set). NEVER world-readable. NEVER logs
+        the values.
+        """
+        try:
+            tmp = self.creds_path.with_suffix(".tmp")
+            # Create the temp file 0600 from the start so the token is never
+            # briefly world-readable, then atomic-rename over the target.
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps({"token": token, "cookie": cookie}).encode())
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+            tmp.rename(self.creds_path)
+            os.chmod(self.creds_path, 0o600)
+        except OSError as e:
+            log.warning("Failed to persist pushed credentials: %s", e)
+
     def set_credentials(self, token: str, cookie: str):
         """Set live credentials pushed by the extension (ISSUES #17).
 
-        Locks the same way refresh_credentials does. NEVER logs the values —
-        only their lengths — so the token/cookie stay out of the log file.
+        Locks the same way the legacy refresh did. Persists to a 0600 file so a
+        restart has creds before the next push. NEVER logs the values — only
+        their lengths — so the token/cookie stay out of the log file.
         """
         with self._lock:
             self.token = token
             self.cookie = cookie
+        self._persist_credentials(token, cookie)
         log.info("Credentials updated via push (token: %d chars, cookie: %d chars)",
                  len(token), len(cookie))
 
@@ -874,7 +925,9 @@ class ReactionPoller:
                 self._poll()
             except RuntimeError as e:
                 if "No credentials" in str(e) or "invalid_auth" in str(e):
-                    log.warning("Credentials invalid, refreshing from Chrome profile...")
+                    # Push model (ISSUES #17): null the stale creds and idle-wait
+                    # for the extension to push fresh ones. No disk-scrape.
+                    log.warning("Credentials invalid; clearing and waiting for a fresh push")
                     self.state.refresh_credentials()
                 else:
                     log.error("Poll error: %s", e)
@@ -2326,11 +2379,11 @@ def main():
         log.error("Vault path does not exist: %s", vault)
         sys.exit(1)
 
-    chrome_profile = Path(cfg["chrome_profile"]).expanduser().resolve()
-    if not chrome_profile.exists():
-        log.error("Chrome profile does not exist: %s", chrome_profile)
-        log.error("Run setup.sh first to sign into Slack.")
-        sys.exit(1)
+    # Chrome profile is retained only as a legacy config field; the push model
+    # (ISSUES #17) no longer reads it. A missing profile is NOT a startup error
+    # anymore — the harvester starts with no creds and idle-waits for the
+    # extension's first POST /creds. resolve() without requiring existence.
+    chrome_profile = Path(cfg.get("chrome_profile", "~/.slack-harvest-profile")).expanduser()
 
     capture_dir = cfg["capture_dir"]
     state_dir = Path(cfg["state_dir"]).expanduser().resolve() if cfg.get("state_dir") else None
@@ -2342,7 +2395,7 @@ def main():
     log.info("Vault: %s", vault)
     log.info("Capture dir: %s/%s", vault, capture_dir)
     log.info("State dir: %s", state_dir or f"{vault}/{capture_dir}/_state")
-    log.info("Chrome profile: %s", chrome_profile)
+    log.info("Cred source: extension push (POST /creds) — Chrome disk-scrape retired (ISSUES #17)")
     log.info("Poll interval: %ds", interval)
     log.info("Trigger reactions: %s", ", ".join(f":{r}:" for r in reactions))
 
