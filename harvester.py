@@ -411,6 +411,18 @@ class HarvesterState:
     def has_credentials(self) -> bool:
         return bool(self.token and self.cookie)
 
+    def set_credentials(self, token: str, cookie: str):
+        """Set live credentials pushed by the extension (ISSUES #17).
+
+        Locks the same way refresh_credentials does. NEVER logs the values —
+        only their lengths — so the token/cookie stay out of the log file.
+        """
+        with self._lock:
+            self.token = token
+            self.cookie = cookie
+        log.info("Credentials updated via push (token: %d chars, cookie: %d chars)",
+                 len(token), len(cookie))
+
     def save_users_cache(self):
         with self._lock:
             self._save_json(self.users_cache_path, self.users)
@@ -1794,6 +1806,54 @@ def handle_slack_proxy(path: str, auth_header: Optional[str],
     return 200, data
 
 
+def handle_creds_ingest(auth_header: Optional[str], expected_token: Optional[str],
+                        raw_body: bytes) -> tuple[int, dict, Optional[tuple[str, str]]]:
+    """Pure core of the POST /creds route — push-ingest of live Slack creds.
+
+    Returns (http_status, body_dict, creds_or_None) where creds_or_None is
+    (token, cookie) ONLY on a fully-valid authed request; the caller then sets
+    state under its lock. On any rejection the third element is None so no
+    partial state is ever set.
+
+    Wiring order is security-first, mirroring handle_slack_proxy:
+      1. Bearer-token check (constant-time). Fail -> 401, no creds.
+      2. Parse JSON body. Malformed / non-object -> 400, no creds.
+      3. Validate token + cookie are present, non-empty strings.
+         Missing/blank/wrong-type -> 400, no creds.
+      4. Valid -> 200 {ok:true}, return (token, cookie).
+
+    NEVER returns the token/cookie values in body_dict (only lengths, via the
+    caller's log line — this function returns just {ok:true}). `expected_token`
+    is injected so this is fully hermetic (no socket, no state object).
+    """
+    # 1. Auth first: an unauthenticated push sets nothing.
+    if not check_bearer_token(auth_header, expected_token):
+        return 401, {"ok": False, "error": "unauthorized"}, None
+
+    # 2. Parse the JSON body defensively — a malformed body is a 400, never a
+    #    crash, and never a partial set.
+    try:
+        parsed = json.loads(raw_body.decode("utf-8")) if raw_body else None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"ok": False, "error": "malformed JSON body"}, None
+
+    if not isinstance(parsed, dict):
+        return 400, {"ok": False, "error": "body must be a JSON object"}, None
+
+    # 3. Both fields required, non-empty strings.
+    token = parsed.get("token")
+    cookie = parsed.get("cookie")
+    if not isinstance(token, str) or not isinstance(cookie, str):
+        return 400, {"ok": False,
+                     "error": "token and cookie must be strings"}, None
+    if not token or not cookie:
+        return 400, {"ok": False,
+                     "error": "token and cookie must be non-empty"}, None
+
+    # 4. Valid — hand the creds back for the caller to set under lock.
+    return 200, {"ok": True}, (token, cookie)
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler (credentials + health + read-only Slack proxy)
 # ---------------------------------------------------------------------------
@@ -1824,6 +1884,37 @@ class HarvestHandler(BaseHTTPRequestHandler):
             self._respond(status, body)
         else:
             self._respond(404, {"error": "not found"})
+
+    def do_POST(self):
+        route = urlparse(self.path).path
+        if route != "/creds":
+            # Only /creds accepts POST. Any other path that exists for GET
+            # (e.g. /health, /slack) is method-not-allowed under POST; unknown
+            # paths are not found.
+            if route in ("/health", "/slack"):
+                self._respond(405, {"error": "method not allowed"})
+            else:
+                self._respond(404, {"error": "not found"})
+            return
+
+        # Read the body safely: cap by Content-Length, tolerate a missing or
+        # malformed header (treat as empty body -> the pure handler returns
+        # 400, never a crash).
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+
+        status, body, creds = handle_creds_ingest(
+            auth_header=self.headers.get("Authorization"),
+            expected_token=self.api_token,
+            raw_body=raw_body,
+        )
+        # Only set state on a fully-valid authed request (creds is not None).
+        if creds is not None:
+            self.state.set_credentials(creds[0], creds[1])
+        self._respond(status, body)
 
     def _respond(self, code: int, body: dict):
         self.send_response(code)
