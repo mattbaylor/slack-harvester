@@ -166,6 +166,197 @@ def _segment_context_by_gap(messages: list[dict], max_gap_seconds: float) -> lis
     kept_reversed.reverse()                # restore chronological order
     return kept_reversed
 
+
+# Reaction reconciler (ISSUES #16) — the independent fallback detection path.
+# The primary poller depends SOLELY on Slack's `hasmy::<emoji>:` search filter,
+# whose per-session index wedged for ~40h (2026-07-15→17), silently freezing
+# captures. The reconciler is a second, independent path built on
+# conversations.history (real-time fresh, never wedged during that outage): it
+# enumerates the user's active conversations and scans recent messages for the
+# authed user's trigger reactions, sharing the poller's seen.json + dedup key +
+# CaptureWorker queue so neither path can double-capture. These defaults bound
+# API cost; both are overridable via config.json.
+DEFAULT_RECONCILE_INTERVAL_MINUTES = 5    # Separate from the 60s hasmy: poll.
+DEFAULT_RECONCILE_WINDOW_HOURS = 48       # First-scan look-back per channel.
+# Cap on users.conversations pages fetched per cycle — a guard against runaway
+# pagination if the account is in an unexpectedly large number of conversations.
+# Slack returns up to `limit` (we ask 200) per page; 10 pages covers ~2000
+# conversations, far more than a real user's active set.
+RECONCILE_MAX_CONVERSATION_PAGES = 10
+
+
+def _resolve_reconcile_interval_seconds(config: Optional[dict]) -> float:
+    """Resolve the reconcile cadence, in seconds, from config.
+
+    Reads `reconcile_interval_minutes` if present and positive; otherwise falls
+    back to DEFAULT_RECONCILE_INTERVAL_MINUTES. Pure — no I/O. A non-positive or
+    unparseable value is ignored (falls back to the default) rather than
+    collapsing the cadence to a hot loop.
+    """
+    minutes = DEFAULT_RECONCILE_INTERVAL_MINUTES
+    if config:
+        raw = config.get("reconcile_interval_minutes")
+        if raw is not None:
+            try:
+                candidate = float(raw)
+                if candidate > 0:
+                    minutes = candidate
+            except (TypeError, ValueError):
+                log.warning(
+                    "Invalid reconcile_interval_minutes=%r in config; using default %sm",
+                    raw, DEFAULT_RECONCILE_INTERVAL_MINUTES,
+                )
+    return minutes * 60.0
+
+
+def _resolve_reconcile_window_seconds(config: Optional[dict]) -> float:
+    """Resolve the first-scan look-back window, in seconds, from config.
+
+    Reads `reconcile_window_hours` if present and positive; otherwise falls back
+    to DEFAULT_RECONCILE_WINDOW_HOURS. Pure — no I/O. Non-positive/unparseable
+    ignored (falls back to the default) so a channel's first scan always has a
+    real bounded window rather than a zero-width one.
+    """
+    hours = DEFAULT_RECONCILE_WINDOW_HOURS
+    if config:
+        raw = config.get("reconcile_window_hours")
+        if raw is not None:
+            try:
+                candidate = float(raw)
+                if candidate > 0:
+                    hours = candidate
+            except (TypeError, ValueError):
+                log.warning(
+                    "Invalid reconcile_window_hours=%r in config; using default %sh",
+                    raw, DEFAULT_RECONCILE_WINDOW_HOURS,
+                )
+    return hours * 3600.0
+
+
+def message_has_my_trigger_reaction(
+    message: dict, authed_user_id: str, trigger_reactions: set,
+) -> bool:
+    """Pure predicate: does THIS message carry one of MY trigger reactions?
+
+    A message qualifies iff at least one entry in its inline `reactions[]` has
+    BOTH (a) an emoji `name` in `trigger_reactions` AND (b) the authed user's id
+    in that reaction's `users[]`. This is the reconciler's core match rule; it
+    deliberately mirrors what the primary hasmy: path finds (Matt's own trigger
+    reactions), just discovered via conversations.history instead of search.
+
+    Correctly EXCLUDES:
+    - other people's reactions (authed id not in that reaction's users[]),
+    - the authed user's NON-trigger reactions (emoji not in trigger set),
+    - messages with no reactions[] at all.
+
+    Slack emoji names may carry a skin-tone suffix (e.g. `+1::skin-tone-3`); we
+    match on the base name before `::` so a trigger reaction still counts
+    regardless of skin tone. Pure — no I/O, no globals.
+
+    `trigger_reactions` should be a set (or any membership-testable container)
+    of bare emoji names WITHOUT surrounding colons, matching the `reactions`
+    config list the poller already uses.
+    """
+    if not authed_user_id:
+        return False
+    reactions = message.get("reactions")
+    if not isinstance(reactions, list):
+        return False
+    for reaction in reactions:
+        if not isinstance(reaction, dict):
+            continue
+        name = reaction.get("name")
+        if not isinstance(name, str):
+            continue
+        base = name.split("::", 1)[0]   # strip a skin-tone modifier if present
+        if base not in trigger_reactions:
+            continue
+        users = reaction.get("users")
+        if isinstance(users, list) and authed_user_id in users:
+            return True
+    return False
+
+
+def select_new_and_mine(
+    messages: list[dict],
+    authed_user_id: str,
+    trigger_reactions: set,
+    oldest_ts: Optional[float],
+) -> list[dict]:
+    """Filter a conversations.history batch to messages that are new AND mine.
+
+    Pure — no I/O. "New" means strictly newer than `oldest_ts` (the per-channel
+    watermark); "mine" means `message_has_my_trigger_reaction` is true. When
+    `oldest_ts` is None (a channel's first-ever scan), the window bound is
+    enforced by the CALLER via the conversations.history `oldest` param, so this
+    function applies no lower bound in that case.
+
+    The strict `>` comparison against the watermark is what makes a second
+    immediate cycle a near-no-op: a message exactly at the watermark (already
+    scanned last cycle) is not re-selected. Combined with the shared seen.json
+    dedup ledger, this is belt-and-suspenders against re-capture.
+
+    Returned messages preserve input order. Malformed/missing `ts` on a message
+    is treated as not-new (skipped) so we never enqueue something we can't build
+    a dedup key for.
+    """
+    selected: list[dict] = []
+    for m in messages:
+        ts_raw = m.get("ts")
+        try:
+            ts = float(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        if oldest_ts is not None and ts <= oldest_ts:
+            continue
+        if message_has_my_trigger_reaction(m, authed_user_id, trigger_reactions):
+            selected.append(m)
+    return selected
+
+
+def compute_new_watermark(
+    messages: list[dict], current_watermark: Optional[float],
+) -> Optional[float]:
+    """Compute the advanced per-channel watermark after scanning a batch.
+
+    Pure — no I/O. The new watermark is the max of the current watermark and the
+    newest (largest) `ts` seen in `messages`. This advances the watermark to the
+    newest message SCANNED (not merely the newest one matched), so a channel
+    with new-but-non-trigger traffic still advances and each cycle only scans
+    genuinely new messages — bounding cost.
+
+    Returns:
+    - The larger of current_watermark and the max message ts, when messages
+      have parseable timestamps.
+    - The unchanged current_watermark when the batch is empty or every ts is
+      malformed (nothing scanned to advance past).
+
+    Never moves the watermark BACKWARD (guards against an out-of-order or
+    partial page regressing it and re-scanning old messages forever).
+    """
+    newest: Optional[float] = current_watermark
+    for m in messages:
+        try:
+            ts = float(m.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if newest is None or ts > newest:
+            newest = ts
+    return newest
+
+
+def reconcile_dedup_key(channel: str, ts: str) -> str:
+    """Build the shared dedup key for a reconciler-found reaction.
+
+    IDENTICAL shape to the poller's `f"{channel}:{ts}"` (harvester.py, the
+    ReactionPoller enqueue path). Factored out so the parity is asserted by a
+    unit test rather than trusted by eye — if the poller's key ever diverges,
+    the test breaks. This is the structural guarantee that a reaction captured
+    by EITHER path is not re-captured by the other (they share seen.json).
+    """
+    return f"{channel}:{ts}"
+
+
 # Asset capture (folder-per-capture layout). Files attached to a Slack message
 # are downloaded into the capture folder as 01.ext, 02.ext, etc.
 ASSET_MAX_BYTES = 100 * 1024 * 1024   # 100 MB; larger files skip and park.
@@ -227,6 +418,14 @@ class HarvesterState:
         self.channels_cache_path = self.state_dir / "channels-cache.json"
         self.users: dict = self._load_json(self.users_cache_path, {})
         self.channels: dict = self._load_json(self.channels_cache_path, {})
+
+        # Reconciler per-channel watermarks (ISSUES #16): {channel_id: last_ts}.
+        # Persisted alongside seen.json so a restart resumes bounded scans
+        # instead of re-scanning each channel's full window. Shape mirrors the
+        # other state files (a plain JSON dict); values are float Slack ts.
+        self.reconcile_watermarks_path = self.state_dir / "reconcile-watermarks.json"
+        self.reconcile_watermarks: dict = self._load_json(
+            self.reconcile_watermarks_path, {})
 
         # Credentials arrive by push from the extension (ISSUES #17), not from
         # a Chrome disk-scrape. On startup, load the last-pushed creds from a
@@ -482,6 +681,32 @@ class HarvesterState:
         with self._lock:
             self._save_json(self.channels_cache_path, self.channels)
 
+    def get_reconcile_watermark(self, channel: str) -> Optional[float]:
+        """Return the last-scanned ts for a channel, or None if never scanned.
+
+        None signals the Reconciler to use the first-scan window bound instead of
+        a watermark. Thread-safe. Values are stored as floats but tolerate a
+        legacy string on load (coerced defensively).
+        """
+        with self._lock:
+            raw = self.reconcile_watermarks.get(channel)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def set_reconcile_watermark(self, channel: str, ts: float):
+        """Persist the advanced per-channel watermark (ISSUES #16).
+
+        Writes the whole watermark map atomically (same _save_json pattern as
+        seen.json). Called once per channel per reconcile cycle.
+        """
+        with self._lock:
+            self.reconcile_watermarks[channel] = ts
+            self._save_json(self.reconcile_watermarks_path, self.reconcile_watermarks)
+
 
 # ---------------------------------------------------------------------------
 # Slack API client
@@ -552,6 +777,73 @@ class SlackClient:
                 log.warning("Search for :%s: failed: %s", reaction, e)
 
         return results
+
+    def list_conversations(self, max_pages: int = RECONCILE_MAX_CONVERSATION_PAGES) -> list[str]:
+        """Enumerate the channel/DM IDs the authed user is a member of.
+
+        Wraps `users.conversations` (public + private channels, DMs, group DMs),
+        paginating via `response_metadata.next_cursor` up to `max_pages` (a guard
+        against runaway pagination). Excludes archived conversations. Returns a
+        list of channel IDs suitable for conversations.history scanning.
+
+        This is the reconciler's default scan-source (ISSUES #16). The xoxc token
+        CAN call users.conversations (verified live 2026-07-17), unlike
+        reactions.list which returns not_allowed_token_type. If the call ever
+        fails anyway (token-type change, error), the RuntimeError propagates and
+        the Reconciler degrades to its configured `reconcile_channels` fallback
+        rather than crashing.
+        """
+        channel_ids: list[str] = []
+        cursor = ""
+        for _ in range(max_pages):
+            params = {
+                "types": "public_channel,private_channel,im,mpim",
+                "limit": "200",
+                "exclude_archived": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            data = self._call("users.conversations", params)
+            for ch in data.get("channels", []):
+                cid = ch.get("id")
+                if cid:
+                    channel_ids.append(cid)
+            cursor = (data.get("response_metadata", {}) or {}).get("next_cursor", "")
+            if not cursor:
+                break
+        return channel_ids
+
+    def scan_channel_reactions(self, channel: str, oldest_ts: Optional[float],
+                               window_seconds: float, limit: int = 200) -> list[dict]:
+        """Fetch recent messages in `channel` via conversations.history.
+
+        Bounded scan (ISSUES #16). The `oldest` lower bound is:
+        - the per-channel watermark (`oldest_ts`) when we've scanned this channel
+          before, so each cycle only pulls messages newer than last time; else
+        - now - window_seconds for a channel's FIRST scan, so we don't pull a
+          channel's entire history.
+
+        Returns the raw message dicts (each may carry inline `reactions[]`); the
+        pure `select_new_and_mine` / `message_has_my_trigger_reaction` helpers do
+        the match. conversations.history returns newest-first; we do NOT reverse
+        here (the reconciler doesn't need chronological order — it filters and
+        dedups by ts).
+
+        This scans only TOP-LEVEL messages (conversations.history), matching the
+        common reaction case. Thread-reply reactions on very old parents remain a
+        documented reconciler limitation (SQ1); the primary hasmy: path catches
+        those once un-wedged.
+        """
+        if oldest_ts is not None:
+            oldest = oldest_ts
+        else:
+            oldest = time.time() - window_seconds
+        data = self._call("conversations.history", {
+            "channel": channel,
+            "oldest": f"{oldest:.6f}",
+            "limit": str(limit),
+        })
+        return data.get("messages", [])
 
     def get_authed_user(self) -> dict:
         """Get info about the authenticated user."""
@@ -975,6 +1267,171 @@ class ReactionPoller:
         else:
             log.debug("Poll: no new trigger reactions (%d total matches across %d reaction(s))",
                       len(matches), len(self.reactions))
+
+
+# ---------------------------------------------------------------------------
+# Reconciler — independent fallback detection via conversations.history (#16)
+# ---------------------------------------------------------------------------
+
+
+class Reconciler:
+    """Second, independent reaction-detection path (ISSUES #16).
+
+    The primary ReactionPoller depends solely on Slack's `hasmy::<emoji>:`
+    search filter, whose per-session index wedged for ~40h (2026-07-15→17) and
+    silently froze captures. This reconciler is a SEPARATE loop, on its own
+    slower cadence, that finds the same trigger reactions via
+    conversations.history (real-time fresh, never wedged during that outage):
+
+      enumerate active conversations (users.conversations)
+        → for each, scan messages newer than its watermark (or the first-scan
+          window) via conversations.history
+        → keep messages carrying MY trigger reaction that are new
+        → build dedup_key = channel:ts (IDENTICAL to the poller's) and enqueue
+          via the SAME CaptureWorker queue, skipping is_seen
+        → advance the per-channel watermark to the newest message scanned.
+
+    Because it shares seen.json + the dedup key + the queue with the poller,
+    neither path can double-capture: whichever finds a reaction first marks it
+    seen, and the other skips it. The primary hasmy: path is untouched — this is
+    additive resilience.
+
+    Mirrors ReactionPoller's thread/loop shape: a daemon thread, has_credentials
+    gating, invalid_auth → refresh_credentials, broad exception → log-and-continue.
+    """
+
+    def __init__(self, state: HarvesterState, client: SlackClient,
+                 worker: "CaptureWorker", reactions: list):
+        self.state = state
+        self.client = client
+        self.worker = worker
+        # Bare emoji names (no colons), same list the poller triggers on.
+        self.reactions = reactions
+        self.trigger_set = set(reactions)
+        self.interval_seconds = _resolve_reconcile_interval_seconds(state.config)
+        self.window_seconds = _resolve_reconcile_window_seconds(state.config)
+        # Optional config fallback list (SQ3): used only if users.conversations
+        # is not callable by the token. A list of channel IDs Matt maintains.
+        self.channels_override = state.config.get("reconcile_channels") or []
+        self.user_id: Optional[str] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            if not self.state.has_credentials():
+                log.debug("Reconciler: no credentials yet, sleeping %.0fs",
+                          self.interval_seconds)
+                time.sleep(self.interval_seconds)
+                continue
+
+            try:
+                self._reconcile_once()
+            except RuntimeError as e:
+                if "No credentials" in str(e) or "invalid_auth" in str(e):
+                    # Push model (ISSUES #17): null stale creds, idle-wait for a
+                    # fresh push. Same recovery as the poller.
+                    log.warning("Reconciler: credentials invalid; clearing and "
+                                "waiting for a fresh push")
+                    self.state.refresh_credentials()
+                else:
+                    log.error("Reconcile error: %s", e)
+            except Exception as e:  # noqa: BLE001
+                log.error("Reconcile error: %s", e, exc_info=True)
+
+            time.sleep(self.interval_seconds)
+
+    def _channels_to_scan(self) -> list[str]:
+        """Resolve the scan list, degrading gracefully (AC9 / SQ3).
+
+        Prefers users.conversations (auto-discovers active channels/DMs). If that
+        call fails (token-type or any error), logs and falls back to the
+        configured `reconcile_channels` list rather than crashing the harvester.
+        Logs which mode it's in so an operator can tell auto-discovery from
+        fallback.
+        """
+        try:
+            channels = self.client.list_conversations()
+            log.debug("Reconciler: users.conversations returned %d channel(s)",
+                      len(channels))
+            return channels
+        except Exception as e:  # noqa: BLE001
+            if self.channels_override:
+                log.warning("Reconciler: users.conversations failed (%s); "
+                            "falling back to configured reconcile_channels (%d)",
+                            e, len(self.channels_override))
+                return list(self.channels_override)
+            log.warning("Reconciler: users.conversations failed (%s) and no "
+                        "reconcile_channels fallback configured; skipping this "
+                        "cycle", e)
+            return []
+
+    def _reconcile_once(self):
+        # Discover our user id on first cycle (source of reaction-match identity).
+        if not self.user_id:
+            auth = self.client.get_authed_user()
+            self.user_id = auth.get("user_id")
+            log.info("Reconciler authenticated as user %s (%s)",
+                     auth.get("user"), self.user_id)
+
+        channels = self._channels_to_scan()
+        total_new = 0
+        for channel in channels:
+            try:
+                total_new += self._reconcile_channel(channel)
+            except RuntimeError as e:
+                if "invalid_auth" in str(e) or "No credentials" in str(e):
+                    raise  # let _run handle the auth recovery
+                # Per-channel failure (e.g. not_in_channel) shouldn't abort the
+                # whole cycle — log and move on to the next channel.
+                log.warning("Reconciler: scan of %s failed: %s", channel, e)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Reconciler: scan of %s failed: %s", channel, e)
+
+        if total_new:
+            log.info("Reconciler: enqueued %d new capture(s) across %d channel(s)",
+                     total_new, len(channels))
+        else:
+            log.debug("Reconciler: no new trigger reactions across %d channel(s)",
+                      len(channels))
+
+    def _reconcile_channel(self, channel: str) -> int:
+        """Scan one channel since its watermark; enqueue new-and-mine. Returns count."""
+        watermark = self.state.get_reconcile_watermark(channel)
+        messages = self.client.scan_channel_reactions(
+            channel, watermark, self.window_seconds)
+
+        new_mine = select_new_and_mine(
+            messages, self.user_id, self.trigger_set, watermark)
+
+        enqueued = 0
+        for msg in new_mine:
+            ts = msg.get("ts")
+            if not ts:
+                continue
+            dedup_key = reconcile_dedup_key(channel, ts)
+            if self.state.is_seen(dedup_key):
+                continue
+            log.info("Reconciler found trigger reaction: channel=%s ts=%s text=%s",
+                     channel, ts, (msg.get("text") or "")[:60])
+            self.state.mark_seen(dedup_key)
+            self.worker.enqueue({
+                "channel": channel,
+                "ts": ts,
+                "workspace_domain": "app.slack.com",
+            })
+            enqueued += 1
+
+        # Advance the watermark to the newest message SCANNED (not just matched),
+        # so a channel with only non-trigger traffic still advances and next
+        # cycle only pulls genuinely new messages. Only persist if it moved.
+        new_watermark = compute_new_watermark(messages, watermark)
+        if new_watermark is not None and new_watermark != watermark:
+            self.state.set_reconcile_watermark(channel, new_watermark)
+
+        return enqueued
 
 
 # ---------------------------------------------------------------------------
@@ -2431,6 +2888,10 @@ def main():
 
     worker = CaptureWorker(state, client, opencode_cmd)
     poller = ReactionPoller(state, client, worker, interval, reactions)
+    # Independent fallback detection path (ISSUES #16). Its own slower cadence,
+    # shares seen.json + dedup key + the worker queue with the poller so neither
+    # double-captures. Additive — the hasmy: poll above is untouched.
+    reconciler = Reconciler(state, client, worker, reactions)
 
     HarvestHandler.state = state
     HarvestHandler.worker = worker
@@ -2479,6 +2940,11 @@ def main():
 
     poller.start()
     log.info("Poller started")
+    reconciler.start()
+    log.info("Reconciler started (cadence %.0fs, first-scan window %.0fh; "
+             "channel source: users.conversations, fallback list configured: %s)",
+             reconciler.interval_seconds, reconciler.window_seconds / 3600.0,
+             bool(reconciler.channels_override))
 
     server = HTTPServer(("127.0.0.1", port), HarvestHandler)
     log.info("Health check: http://127.0.0.1:%d/health", port)

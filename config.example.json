@@ -16,5 +16,9 @@
     "noted"
   ],
   "opencode_command": "opencode",
-  "context_max_gap_hours": 6
+  "context_max_gap_hours": 6,
+  "_comment_reconciler": "ISSUES #16: the reconciler is an INDEPENDENT fallback detection path that scans conversations.history for your trigger reactions, so captures keep working if Slack's hasmy: search filter wedges (the ~40h 2026-07-15 outage). It shares seen.json + the dedup key with the primary poller, so no duplicates.",
+  "reconcile_interval_minutes": 5,
+  "reconcile_window_hours": 48,
+  "_comment_reconcile_channels": "OPTIONAL. Fallback list of channel IDs to scan, used ONLY if users.conversations is not callable by the token. Normally omit this — the reconciler auto-discovers your active channels/DMs via users.conversations. Example: [\"C0123\", \"D0456\"]."
 }

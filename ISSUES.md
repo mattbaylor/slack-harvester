@@ -417,6 +417,73 @@ stay open only for their non-cred aspects.
 auto-relogin (the extension alerts, Matt re-signs-in); Plan C (#16 resilience,
 stacks on top after creds are stable).
 
+### #16 — 🟢 Reaction detection is a single point of failure on the wedge-prone `hasmy:` filter (FIXED 2026-07-21, live-verify owed)
+
+**Where:** `harvester.py:SlackClient.search_reactions` +
+`harvester.py:ReactionPoller` (the sole detection path).
+**Symptom:** Captures silently stopped 2026-07-15 21:24 → 2026-07-17 15:52 (~40h).
+No error; the poller logged "no new trigger" every cycle while Matt's
+`:eyes:`/`:cap:` reactions piled up uncaptured. Cleared only after a reboot +
+clean single-session re-sign-in.
+**Cause (proven live):** The poller depends **entirely** on Slack's
+`search.messages?query=hasmy::<emoji>:` filter, served by a per-session
+reaction-search index that can wedge: it returned a frozen snapshot (newest
+7/15 21:24) while GENERAL search stayed real-time. One filter, one index, no
+fallback — a single point of failure. `reactions.list` is not an alternative
+(`not_allowed_token_type` for the xoxc token, proven). `conversations.history`
+returns inline `reactions:[{name,users:[...],count}]` and was real-time fresh
+throughout the outage (`:eyes:` showed `users=['U0ATR90VBMJ']`, positively
+identifying Matt's own reaction).
+**Fix shipped:** Added an **independent fallback detection path** — a
+`Reconciler` — that runs alongside the untouched `hasmy:` poller:
+1. **Second periodic loop.** `Reconciler` mirrors `ReactionPoller`'s daemon-thread
+   shape (has_credentials gating, `invalid_auth` → `refresh_credentials`, broad
+   exception → log-and-continue) on its OWN slower cadence
+   (`reconcile_interval_minutes`, default 5) separate from the 60s poll. The
+   primary path is behaviorally unchanged — additive only.
+2. **Enumerate → scan → match.** Each cycle enumerates the user's active
+   conversations via `SlackClient.list_conversations()` (`users.conversations`,
+   paginated, `exclude_archived`, page-capped), then for each channel scans
+   messages newer than a per-channel watermark (or a first-scan window bound)
+   via `SlackClient.scan_channel_reactions()` (`conversations.history` with an
+   `oldest` param). Bounded cost: window on first scan, watermark thereafter.
+3. **Shared dedup — no duplicates.** Builds `dedup_key = channel:ts` via the
+   factored `reconcile_dedup_key` (a unit test pins byte-parity with the
+   poller's literal `f"{channel}:{ts}"`), skips `is_seen`, marks seen, and
+   enqueues through the SAME `CaptureWorker` queue. Because both paths share
+   `seen.json` + the identical key, whichever finds a reaction first wins and the
+   other skips it — structurally impossible to double-capture (O2).
+4. **Per-channel watermark** persisted to a new `<state_dir>/reconcile-watermarks.json`
+   (same atomic `_save_json` pattern as `seen.json`), advanced to the newest
+   message SCANNED each cycle (not just matched) so a channel with only
+   non-trigger traffic still advances; a second immediate cycle is a no-op.
+5. **Match logic** identifies ONLY the authed user's TRIGGER reactions (authed id
+   in a reaction's `users[]` AND emoji in the existing `reactions` config list;
+   skin-tone suffixes stripped) — not others' reactions, not non-trigger emojis.
+6. **Graceful degradation (SQ3).** If `users.conversations` ever fails
+   (token-type or error), the reconciler logs and falls back to an optional
+   `reconcile_channels` config list — or skips the cycle if none — rather than
+   crashing the harvester.
+The pure logic is factored into hermetically-testable module functions —
+`message_has_my_trigger_reaction`, `select_new_and_mine`, `compute_new_watermark`,
+`reconcile_dedup_key`, and the two config resolvers — covered by
+`tests/test_reconciler.py` (27 tests, no network/Slack/opencode/Chrome; fake
+client/worker/state injected for the `_reconcile_channel` wiring path).
+Config knobs (`reconcile_interval_minutes`, `reconcile_window_hours`,
+`reconcile_channels`) documented in `config.example.json`; dual-path detection
+documented in `README.md`.
+**Live-verify owed (needs live time on the running harvester):** O1 — with the
+`hasmy:` path wedged (real wedge or a cleared dedup key), a fresh `:eyes:` on a
+recent message produces a capture within one reconcile cycle via the reconciler
+path; O2-live — a single reaction captured by the primary path is not
+re-captured after a reconcile cycle. Both need real wall-clock time on the live
+daemon; the dedup/match/watermark correctness is code-proven here.
+**Not in scope:** exhaustive/guaranteed-complete scan of ALL history in ALL
+channels (SQ1 — bounded-scan resilience for the common case; a reaction on a very
+old message in a quiet channel still waits for the un-wedged `hasmy:` path);
+removing the `hasmy:` path (kept as the cheap fast primary); the Events API /
+websocket approach; fixing Slack's `hasmy:` wedge itself (server-side).
+
 ### #4 — 🔴 Two opencode installations diverge silently
 
 **Symptom:** Harvester invokes Homebrew opencode 1.15.5 (May 22 install). Interactive use is a separate sandboxed pnpm-dlx opencode install (different state dir, different auth). Model behind `claude-opus-4.7` alias in Copilot can drift; harvester silently gets a different model than tested with.
@@ -445,6 +512,7 @@ stacks on top after creds are stable).
 | 2e | #14 | 🟢 Shipped 2026-07-16. Loopback token-guarded read-only Slack proxy seam (`GET /slack`). Advances #9c/#6, both still open. |
 | 2f | #15 | 🟢 Shipped 2026-07-16. Time-gap segmentation bounds channel context to the anchor's conversational burst; prompt boundary rule + config knob (`context_max_gap_hours`, default 6h). First hermetic test. |
 | 2g | #17 | 🟢 Shipped 2026-07-21 (live-verify owed). Push-model creds: companion Chrome extension reads the live session + keeps warm + alerts on logout, `POST /creds` ingest (bearer-authed, locked, validated, persisted 0600), chrome_creds retired from runtime. Retires the cred-fragility class behind #6/#9a/#9b/#9c. O1 soak + O2 logout alert need Matt to load the extension. |
+| 2h | #16 | 🟢 Shipped 2026-07-21 (live-verify owed). Independent `conversations.history` reconciler as a fallback to the wedge-prone `hasmy:` path: own 5-min cadence, `users.conversations` enumeration + per-channel watermarks (`reconcile-watermarks.json`), shares `seen.json` + `channel:ts` dedup key + the CaptureWorker queue (no duplicates). Pure match/watermark/dedup logic factored + hermetically tested (`tests/test_reconciler.py`). O1 (catch when `hasmy:` wedged) + O2-live (no double-capture) need live time. |
 | 3 | #9b | ⚪ Largely mooted by #17 (no Chrome profile to sandbox-couple). |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |
 | 5 | #9c, #9d, #9 KeepAlive plist | 🔴 Deeper healthcheck probes + auto-restart on crash. |

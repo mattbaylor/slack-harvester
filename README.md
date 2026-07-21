@@ -9,9 +9,17 @@ Slack (any client)
   you react with :bookmark:
        │
        ▼
-  harvester.py (polls Slack search API every 60s)
+  harvester.py — TWO independent detection paths (ISSUES #16):
        │
-       ├─ finds new reactions via search.messages
+       ├─ PRIMARY poller (every 60s): finds reactions via search.messages
+       │    `hasmy::<emoji>:` — fast + cheap, but its search index can wedge
+       │
+       ├─ FALLBACK reconciler (every 5 min): scans conversations.history for
+       │    your trigger reactions in active channels — independent of the
+       │    search index, so captures survive a hasmy: wedge
+       │
+       │  (both share seen.json + the channel:ts dedup key → no duplicates)
+       │
        ├─ fetches thread or channel context
        ├─ resolves user/channel names
        ├─ enumerates attached files (files[] + blocks[].image)
@@ -30,6 +38,18 @@ Slack (any client)
 ```
 
 Credentials are pushed to the harvester by a companion Chrome extension (`extension/`) that reads your **live** Slack web session — the `xoxc` token from `localStorage` and the `d` cookie via `chrome.cookies` — keeps the session warm, and `POST`s the creds to a loopback endpoint. The harvester no longer scrapes the Chrome profile on disk (ISSUES #17). You sign into Slack web **once** in the browser where the extension is loaded; from then on the extension keeps the harvester authenticated and alerts you if you get logged out.
+
+### Dual-path detection (ISSUES #16)
+
+Reactions are found by **two independent paths** so a failure in one doesn't stop captures:
+
+- **Primary — the `hasmy:` poller** (every `poll_interval`, default 60s). Runs one `search.messages?query=hasmy::<emoji>:` query per trigger emoji. Fast and cheap when healthy, but it depends on a per-session reaction-search index that can **wedge** — on 2026-07-15→17 it returned a frozen snapshot for ~40h while general search stayed real-time, and captures silently stopped.
+
+- **Fallback — the reconciler** (every `reconcile_interval_minutes`, default 5). An *independent* path that enumerates your active conversations (`users.conversations`) and scans recent messages via `conversations.history`, which returns inline `reactions[]` (including who reacted) and was never wedged during that outage. For each channel it scans only messages newer than a persisted per-channel **watermark** (`_state/reconcile-watermarks.json`), bounded by `reconcile_window_hours` on a channel's first scan — so cost stays bounded and a repeat cycle over the same messages is a no-op.
+
+Both paths **share the same dedup ledger** (`seen.json`) and the identical `channel:ts` dedup key, and enqueue through the same capture worker. Whichever path finds a reaction first marks it seen; the other skips it — so there are **no duplicate captures** regardless of which path wins. The reconciler is purely additive: the primary poller's behavior is unchanged.
+
+**Bounded-scope limitation:** the reconciler catches recent reactions in your active conversations, not every reaction on every old message everywhere. A reaction on a very old message in a quiet channel is left for the primary `hasmy:` path to pick up once it un-wedges.
 
 ## Requirements
 
@@ -159,9 +179,12 @@ Copy `config.example.json` to `config.json` and edit (or let `setup.sh` do it):
 | `vault_path` | Root of your Obsidian vault (or any directory). |
 | `capture_dir` | Directory name inside the vault for captures. Created automatically. |
 | `chrome_profile` | **Deprecated (ISSUES #17).** No longer read — creds are pushed by the extension. Retained for backward compat; safe to delete. |
-| `poll_interval` | Seconds between polls. 60 is fine; this isn't latency-sensitive. |
-| `reactions` | Emoji names (without colons) that trigger a capture. Use whatever feels natural. |
+| `poll_interval` | Seconds between primary-path polls. 60 is fine; this isn't latency-sensitive. |
+| `reactions` | Emoji names (without colons) that trigger a capture. Use whatever feels natural. Shared by both detection paths. |
 | `opencode_command` | Path or name of the opencode CLI binary. |
+| `reconcile_interval_minutes` | Cadence of the fallback reconciler (ISSUES #16), separate from `poll_interval`. Default 5. |
+| `reconcile_window_hours` | How far back the reconciler looks the FIRST time it scans a channel (thereafter it uses a per-channel watermark). Default 48. |
+| `reconcile_channels` | **Optional.** Fallback list of channel IDs to scan, used only if `users.conversations` isn't callable by your token. Normally omit — the reconciler auto-discovers your active channels. |
 
 `config.json` is gitignored — each person keeps their own.
 
@@ -323,7 +346,7 @@ state dir — that's the file the running process compares against.
 ## Limitations
 
 - **Cross-platform harvester, Chrome-bound extension** — the harvester itself no longer depends on the macOS Keychain (the disk-scrape path is retired). The companion extension needs Chrome (any OS) signed into Slack web.
-- **`xoxc` token scope** — some Slack API methods don't work with session tokens. The harvester uses `search.messages` (which works) instead of `reactions.list` (which doesn't) for the poller.
+- **`xoxc` token scope** — some Slack API methods don't work with session tokens. The primary poller uses `search.messages` and the fallback reconciler uses `users.conversations` + `conversations.history` (all of which work with the session token) instead of `reactions.list` (which returns `not_allowed_token_type`).
 - **One workspace** — the config supports a single workspace. For multiple workspaces, run separate instances with separate configs.
 - **Keep-warm horizon** — the SQ2 prototype proved short-horizon keep-warm (~49 min); the overnight-untended case is verified by the logout alert (O2) rather than guaranteed to never expire. See ISSUES #17.
 
