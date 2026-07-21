@@ -142,9 +142,16 @@ def test_auth_gate(failures: list) -> None:
 
 def test_allow_list(failures: list) -> None:
     print("\n--- method allow-list (403 makes no Slack call)")
+    # The allow-list is read-only-only. Beyond the original #14 trio it also
+    # carries the read-only diagnostic methods Matt kept on the seam for live
+    # ISSUES #16 investigation (search.messages, reactions.list, reactions.get,
+    # users.conversations). Assert the exact set so an accidental
+    # write/mutating method addition trips the test.
     _check(failures, "allow-list is exactly the read-only set",
            set(SLACK_PROXY_ALLOWED_METHODS) ==
-           {"conversations.history", "conversations.replies", "auth.test"},
+           {"conversations.history", "conversations.replies", "auth.test",
+            "search.messages", "reactions.list", "reactions.get",
+            "users.conversations"},
            f"got {set(SLACK_PROXY_ALLOWED_METHODS)}")
 
     # Listed method passes.

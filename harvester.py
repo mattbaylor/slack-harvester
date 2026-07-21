@@ -1649,6 +1649,20 @@ SLACK_PROXY_ALLOWED_METHODS = frozenset({
     "conversations.history",
     "conversations.replies",
     "auth.test",
+    # search.messages is read-only and is the poller's own trigger query; having
+    # it on the seam lets us diagnose "reactions not being picked up" live
+    # against the running daemon's creds without touching Chrome (ISSUES #16
+    # investigation, 2026-07-17).
+    "search.messages",
+    # reactions.list / reactions.get are read-only and are candidate replacements
+    # for the wedged hasmy: search filter (ISSUES #16). On the seam for live
+    # comparison against search.messages freshness.
+    "reactions.list",
+    "reactions.get",
+    # users.conversations enumerates the channels/DMs the user is in — candidate
+    # source for the reconciler's scan list (ISSUES #16). Read-only; probed to
+    # confirm the xoxc token can call it (reactions.list could NOT).
+    "users.conversations",
 })
 
 
