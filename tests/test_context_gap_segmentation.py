@@ -11,8 +11,7 @@ functions and the static prompt builder.
 
 Bug being guarded: in a quiet DM, `get_context` fetched the last N messages by
 count with no time window, so a captured message pulled a days-old prior
-conversation into its "relevant context". See the failed capture at
-~/vault/51-slack-captures/2026-07-15/2026-07-15-rangel-commented-some-things/.
+conversation into its "relevant context". See ISSUES.md (count-only context bug).
 
 Run (from repo root):
     python3 tests/test_context_gap_segmentation.py
@@ -37,13 +36,13 @@ from harvester import (  # noqa: E402
     _segment_context_by_gap,
 )
 
-FIXTURE = REPO_ROOT / "tests" / "fixtures" / "rangel-window.json"
+FIXTURE = REPO_ROOT / "tests" / "fixtures" / "context-window.json"
 # A real seam-fetched window (gitignored) overrides the committed synthetic one
 # when present — see the synthetic fixture's _fixture_note for the fetch command.
-FIXTURE_REAL = REPO_ROOT / "tests" / "fixtures" / "rangel-window.real.json"
+FIXTURE_REAL = REPO_ROOT / "tests" / "fixtures" / "context-window.real.json"
 
 SIX_HOURS = 6 * 3600.0
-ANCHOR_TS = 1784148148.166149  # 2026-07-15T20:42:28Z — the Rangel PR-comment ping
+ANCHOR_TS = 1784148148.166149  # the recent PR-comment ping (anchor)
 
 
 def _msg(ts: float, text: str = "", user: str = "U") -> dict:
@@ -51,11 +50,11 @@ def _msg(ts: float, text: str = "", user: str = "U") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# O1 — real-window (synthetic here) fixture: Friday burst is dropped
+# O1 — real-window (synthetic here) fixture: old burst is dropped
 # ---------------------------------------------------------------------------
 
-def test_o1_fixture_drops_friday_keeps_anchor_day() -> None:
-    """The Rangel window at 6h keeps only 2026-07-15 (anchor day); no Friday."""
+def test_o1_fixture_drops_old_burst_keeps_anchor_day() -> None:
+    """The context window at 6h keeps only the anchor-day burst; no old burst."""
     src = FIXTURE_REAL if FIXTURE_REAL.exists() else FIXTURE
     data = json.loads(src.read_text())
     window = data["messages"]
@@ -66,23 +65,23 @@ def test_o1_fixture_drops_friday_keeps_anchor_day() -> None:
 
     trimmed = _segment_context_by_gap(window, SIX_HOURS)
 
-    # None of the Friday 2026-07-10 merge-session messages survive.
-    # Friday messages are all < the 2026-07-15 boundary epoch.
-    boundary = 1784102400.0  # 2026-07-15T08:00:00Z — anything before is a prior day
+    # None of the older merge-session messages survive. They all fall before
+    # the anchor-day boundary epoch.
+    boundary = 1784102400.0  # anchor-day start — anything before is a prior day
     for m in trimmed:
         assert float(m["ts"]) >= boundary, (
-            f"Friday/pre-gap message leaked through: ts={m['ts']} "
+            f"old/pre-gap message leaked through: ts={m['ts']} "
             f"text={m.get('text', '')[:60]!r}"
         )
     # The earliest kept message is on the anchor's day.
     earliest_ts = float(trimmed[0]["ts"])
     assert earliest_ts >= boundary, "earliest kept message is not on anchor day"
-    # The specific Friday content must be gone.
+    # The specific older-burst content must be gone.
     joined = " ".join(m.get("text", "") for m in trimmed)
-    assert "Merged 6/6" not in joined
-    assert "16963" not in joined
+    assert "Merged it" not in joined
+    assert "PR-101" not in joined
     # The anchor-day burst content is retained.
-    assert any("16969" in m.get("text", "") for m in trimmed)
+    assert any("PR-202" in m.get("text", "") for m in trimmed)
 
 
 # ---------------------------------------------------------------------------

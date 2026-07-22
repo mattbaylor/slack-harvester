@@ -10,7 +10,7 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 
 ## Triggering incident
 
-- 2026-06-03 13:14:53 local: `:cap:` on `#team-ux-admin` ts `1780513854.323999`. Harvester logged `Capture written for #team-ux-admin/1780513854.323999` at 13:15:05. `seen.json` updated. **No file in `~/vault/51-slack-captures/2026-06-03/`.** `opencode run` returned rc=0 but never wrote.
+- 2026-06-03 13:14:53 local: `:cap:` on `#some-channel` ts `1780513854.323999`. Harvester logged `Capture written for #some-channel/1780513854.323999` at 13:15:05. `seen.json` updated. **No file in `~/vault/51-slack-captures/2026-06-03/`.** `opencode run` returned rc=0 but never wrote.
 - Same morning: machine had been rebooted; harvester re-started via launchd at 06:23. First `:cap:` after reboot is the one that silently failed.
 - Earlier orphans in `~/vault/51-slack-captures/_pending/`: 1 from 2026-05-27 (`opencode timed out`), 20 from 2026-06-02 (`No such file or directory: 'opencode'`). Both are from a previous architecture (WebSocket extension) and predate the current search-poll sink. Not in scope for fixes; cleanup tracked as #8.
 
@@ -50,9 +50,9 @@ Status legend: 🔴 open / 🟡 in progress / 🟢 fixed / ⚪ won't fix.
 - **9d** opencode 1.15.5 persistent daemon not running post-boot; first `opencode run` triggers cold-start (auth init, model registry, possible WAL recovery on `opencode.db`); race conditions plausible.
 - **9e** `healthcheck.sh` cooldown file persists across reboot, suppressing alerts for up to 30 min post-boot.
 
-**#9a fix shipped:** `startup_self_test()` in `harvester.py` runs at startup with two probes — Slack `auth.test` and an opencode stdout round-trip ("reply with PONG"). On any failure, DMs Matt immediately via `_dm_self()`. Doesn't block startup; harvester continues so partial outages still park to `_pending/`.
+**#9a fix shipped:** `startup_self_test()` in `harvester.py` runs at startup with two probes — Slack `auth.test` and an opencode stdout round-trip ("reply with PONG"). On any failure, DMs the user immediately via `_dm_self()`. Doesn't block startup; harvester continues so partial outages still park to `_pending/`.
 **Still open:**
-- KeepAlive plist change (manual edit to `~/Library/LaunchAgents/com.baylor.slack-harvester.plist`).
+- KeepAlive plist change (manual edit to `~/Library/LaunchAgents/com.example.slack-harvester.plist`).
 - #9b chrome-profile path is sandbox-coupled (tracked below).
 - #9c healthcheck doesn't exercise the pipeline (tracked below).
 - #9d opencode db integrity check (tracked below).
@@ -189,16 +189,15 @@ direction, fix forward only — bad files stay where they are.
 **Where:** `harvester.py:CaptureWorker.process` (Step 3 name resolution)
 and `_invoke_opencode` (body prompt).
 **Symptom:** When a captured message `@`-mentions people, the wrong name
-can appear in the capture body. Observed: capture
-`2026-07-13/2026-07-13-riverginther-so-don-forget/capture.md` rendered
-River's opening ping as `[[John]] [[Josh Wilson]] [[Marco Rangel]]` when
-the message actually pinged **John, jwilson, and matt**. The word "Marco"
-was pulled from a *later* sentence in the same message ("Marco is busy
-with closure compiler…") — a plausible-but-wrong substitution.
+can appear in the capture body. Observed: a capture rendered the opening
+ping as three `[[Wiki Name]]` links, one of which was wrong — a name that
+appeared nowhere in the actual mentions. That name was pulled from a
+*later* sentence in the same message (an unrelated "so-and-so is busy
+with X" aside) — a plausible-but-wrong substitution.
 **Cause:** Name resolution (`resolve_user`) was only applied to message
 **authors** (to build `participants`). Slack mention markup embedded
 *inside* message text (`<@Uxxxx>`, `<#Cxxxx|name>`, `<!subteam^Sxxxx>`)
-was never resolved. The raw text — still carrying `<@U0ATR90VBMJ>` —
+was never resolved. The raw text — still carrying `<@Uxxxx>` —
 was passed to opencode in the bundle (`reacted_message_text`) and stored
 verbatim in the `reacted_message` frontmatter. opencode has **no access
 to the user cache**, so it cannot resolve a raw id; the body-generation
@@ -220,15 +219,15 @@ message text at Step 7 (the reacted `msg` is a separate object fetched via
 prompt and the Python-built frontmatter now see real names only —
 structurally removing opencode's opportunity to guess. Bare link markup
 (`<https://…>`, `<https://…|label>`) is left untouched (regex only matches
-`<@`, `<#`, `<!`). Verified against the ARTI-281 raw ids using the live
-`users-cache.json`: the three-name ping expands to `@John @jwilson @matt`.
-**Backfilled:** The ARTI-281 capture body, `reacted_message` frontmatter,
-and action items were manually corrected (Marco Rangel → Matt for the
-opening ping; the separate "Marco is on closure-compiler work" reference
-was already correct and left as-is). `participants` was already correct
-(authors, not mentions) and untouched.
+`<@`, `<#`, `<!`). Verified against the offending capture's raw ids using
+the live `users-cache.json`: the three-name ping expands to real handles.
+**Backfilled:** The affected capture body, `reacted_message` frontmatter,
+and action items were manually corrected (the hallucinated name → the
+correct one for the opening ping; the separate later reference was already
+correct and left as-is). `participants` was already correct (authors, not
+mentions) and untouched.
 **Not in scope:** Sweeping other historical captures for the same class
-of error. Fix-forward; any pre-2026-07-13 capture with `<@…>` in its
+of error. Fix-forward; any pre-fix capture with `<@…>` in its
 `reacted_message` frontmatter is a candidate for the same latent bug if
 ever re-examined.
 
@@ -236,7 +235,7 @@ ever re-examined.
 
 **Where:** `harvester.py:HarvestHandler.do_GET` (the loopback health server —
 previously `GET /health` only).
-**Symptom:** Local agent tooling (and Matt) had no sanctioned path to fetch a
+**Symptom:** Local agent tooling (and the user) had no sanctioned path to fetch a
 real read-only Slack API result — e.g. a `conversations.history` window to build
 a test fixture. The only credential path, `chrome_creds.py`, reads Chrome's
 LevelDB (`xoxc` token) and Cookies SQLite DB + macOS Keychain (`d` cookie), all
@@ -291,14 +290,12 @@ enough for the fixture use case; noted for a future session).
 `harvester.py:CaptureWorker._build_body_prompt` (body prompt).
 **Symptom:** When a `:cap:`'d message sits in a quiet DM, the capture body
 weaves in a days-old prior conversation as if it were continuous context.
-Observed: capture
-`2026-07-15/2026-07-15-rangel-commented-some-things/capture.md` captured a
-one-line PR-comment ping (Wednesday 2026-07-15 14:42, PR #16969) but its
-"## Relevant context from earlier in the DM" section reconstructed Friday
-2026-07-10's entire ARTI-7 merge session (PR #16963 `...`-menu confusion, the
-screenshot, "Re-review checks pass — good to merge?", "Merged 6/6") — real
-content, but a *different* conversation across a ~5-day silence. It distorted
-the capture's framing and action item.
+Observed: a capture of a one-line PR-comment ping had its
+"## Relevant context from earlier in the DM" section reconstruct an entire
+prior merge session from ~5 days earlier (`...`-menu confusion, a
+screenshot, "Re-review checks pass — good to merge?", "Merged it") — real
+content, but a *different* conversation across a multi-day silence. It
+distorted the capture's framing and action item.
 **Cause:** `get_context` fetched context purely by **count** —
 `conversations.history` with `latest=ts, limit=16, inclusive=true`, then
 `messages.reverse()`. There was **no time window**. In a low-traffic DM, "the
@@ -331,9 +328,10 @@ topic boundary, so it treated the whole window as one thread. Same *class* as
 hermetic test (no live Slack/opencode/Chrome). Covers all six ACs plus config
 resolution and defensive cases; asserts the prompt boundary-rule via the real
 `_build_body_prompt` code path (no copied string). Fixture at
-`tests/fixtures/rangel-window.json` is **synthetic** (built from the capture's
-timestamps; gitignored) with an inline note + the exact seam-fetch curl to
-replace it with a real window once Plan A / #14's seam is running.
+`tests/fixtures/context-window.json` is **synthetic** (built from fabricated
+timestamps) with an inline note + the exact seam-fetch curl to replace it
+with a real window (the `.real.json` name is gitignored) once Plan A /
+#14's seam is running.
 **Thread path untouched:** `get_thread` is already bounded by `thread_ts`; no
 diff there.
 **Not in scope:** Re-generating/backfilling historical captures (fix-forward
@@ -400,12 +398,12 @@ harvester loopback route.
    macOS notification), `config.example.json` (deprecate `chrome_profile`),
    `.gitignore` (ignore `creds.json`), `README.md` (new cred model).
 **Prototype gate PASSED (2026-07-21):** SQ1 (xoxc from localStorage) ✅ proven;
-SQ2 (keep-warm) ✅ passed to Matt's pragmatic bar (11 LIVE probes over 49 min).
+SQ2 (keep-warm) ✅ passed to the user's pragmatic bar (11 LIVE probes over 49 min).
 See the plan's "Test results" for the caveat (49 min ≠ overnight-untended).
-**Live-verify owed (needs Matt to load the extension):** O1 multi-hour soak
+**Live-verify owed (needs the user to load the extension):** O1 multi-hour soak
 (sustained auth across an xoxc rotation with no manual sign-in) and O2 (logout
 fires the alert within one refresh cycle) require the real extension loaded in
-Matt's Chrome + a signed-in Slack web tab. O3 (grep-clean cred source; boots
+the user's Chrome + a signed-in Slack web tab. O3 (grep-clean cred source; boots
 credless; first push flips `has_credentials:true`) is code-verified here; the
 "first push flips it" half needs the live extension.
 **Supersedes / advances:** retires the `chrome_creds` cred-fragility class
@@ -414,7 +412,7 @@ re-scraping a possibly-stale profile) and **#9a/#9b/#9c** (no Chrome profile
 lock, no sandbox-coupled profile path, liveness off `/health`). Those entries
 stay open only for their non-cred aspects.
 **Not in scope:** a Slack OAuth app (xoxb/xoxp — bigger, needs workspace admin);
-auto-relogin (the extension alerts, Matt re-signs-in); Plan C (#16 resilience,
+auto-relogin (the extension alerts, the user re-signs-in); Plan C (#16 resilience,
 stacks on top after creds are stable).
 
 ### #16 — 🟢 Reaction detection is a single point of failure on the wedge-prone `hasmy:` filter (FIXED 2026-07-21, live-verify owed)
@@ -422,7 +420,7 @@ stacks on top after creds are stable).
 **Where:** `harvester.py:SlackClient.search_reactions` +
 `harvester.py:ReactionPoller` (the sole detection path).
 **Symptom:** Captures silently stopped 2026-07-15 21:24 → 2026-07-17 15:52 (~40h).
-No error; the poller logged "no new trigger" every cycle while Matt's
+No error; the poller logged "no new trigger" every cycle while the user's
 `:eyes:`/`:cap:` reactions piled up uncaptured. Cleared only after a reboot +
 clean single-session re-sign-in.
 **Cause (proven live):** The poller depends **entirely** on Slack's
@@ -432,8 +430,8 @@ reaction-search index that can wedge: it returned a frozen snapshot (newest
 fallback — a single point of failure. `reactions.list` is not an alternative
 (`not_allowed_token_type` for the xoxc token, proven). `conversations.history`
 returns inline `reactions:[{name,users:[...],count}]` and was real-time fresh
-throughout the outage (`:eyes:` showed `users=['U0ATR90VBMJ']`, positively
-identifying Matt's own reaction).
+throughout the outage (`:eyes:` showed `users=['U0EXAMPLE01']`, positively
+identifying the user's own reaction).
 **Fix shipped:** Added an **independent fallback detection path** — a
 `Reconciler` — that runs alongside the untouched `hasmy:` poller:
 1. **Second periodic loop.** `Reconciler` mirrors `ReactionPoller`'s daemon-thread
@@ -511,7 +509,7 @@ websocket approach; fixing Slack's `hasmy:` wedge itself (server-side).
 | 2d | #13 | 🟢 Shipped 2026-07-13. Resolve `<@Uxxxx>` mentions in Python before opencode (stop name hallucination). |
 | 2e | #14 | 🟢 Shipped 2026-07-16. Loopback token-guarded read-only Slack proxy seam (`GET /slack`). Advances #9c/#6, both still open. |
 | 2f | #15 | 🟢 Shipped 2026-07-16. Time-gap segmentation bounds channel context to the anchor's conversational burst; prompt boundary rule + config knob (`context_max_gap_hours`, default 6h). First hermetic test. |
-| 2g | #17 | 🟢 Shipped 2026-07-21 (live-verify owed). Push-model creds: companion Chrome extension reads the live session + keeps warm + alerts on logout, `POST /creds` ingest (bearer-authed, locked, validated, persisted 0600), chrome_creds retired from runtime. Retires the cred-fragility class behind #6/#9a/#9b/#9c. O1 soak + O2 logout alert need Matt to load the extension. |
+| 2g | #17 | 🟢 Shipped 2026-07-21 (live-verify owed). Push-model creds: companion Chrome extension reads the live session + keeps warm + alerts on logout, `POST /creds` ingest (bearer-authed, locked, validated, persisted 0600), chrome_creds retired from runtime. Retires the cred-fragility class behind #6/#9a/#9b/#9c. O1 soak + O2 logout alert need the user to load the extension. |
 | 2h | #16 | 🟢 Shipped 2026-07-21 (live-verify owed). Independent `conversations.history` reconciler as a fallback to the wedge-prone `hasmy:` path: own 5-min cadence, `users.conversations` enumeration + per-channel watermarks (`reconcile-watermarks.json`), shares `seen.json` + `channel:ts` dedup key + the CaptureWorker queue (no duplicates). Pure match/watermark/dedup logic factored + hermetically tested (`tests/test_reconciler.py`). O1 (catch when `hasmy:` wedged) + O2-live (no double-capture) need live time. |
 | 3 | #9b | ⚪ Largely mooted by #17 (no Chrome profile to sandbox-couple). |
 | 4 | #3, #7 | 🔴 Observability: `pending_count` + `queue_depth` in healthcheck. |

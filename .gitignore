@@ -15,7 +15,7 @@ creds.json
 
 # Real Slack windows fetched from the API may contain personal DM content —
 # keep those out of git. Synthetic/hand-built fixtures (e.g.
-# tests/fixtures/rangel-window.json) ARE committed: they're test data with no
+# tests/fixtures/context-window.json) ARE committed: they're test data with no
 # real message content, and the suite must be green on a fresh clone.
 tests/fixtures/*.real.json
 

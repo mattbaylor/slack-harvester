@@ -1,0 +1,45 @@
+{
+  "_fixture_note": "SYNTHETIC fixture — NOT a real Slack API response. Hand-built to exercise time-gap context segmentation (see ISSUES.md, count-only context bug). It reproduces the shape that broke a capture: an older merge-session burst (five messages ~25 min apart), a ~5-day (~125h) silence, then a recent PR-comment anchor burst (two messages minutes before the reacted message, then the reacted message itself). This is the CHRONOLOGICAL order (anchor last) that get_context produces after messages.reverse() — feed it straight into _segment_context_by_gap. All users, timestamps, PR references, and text are fabricated; no real workspace, DM, person, or ticket is represented. To exercise the O1 test against a real seam-fetched window instead, drop a file named context-window.real.json alongside this one (that name is gitignored so a real transcript never lands in git); the O1 test prefers the .real.json when present, else falls back to this synthetic file.",
+  "messages": [
+    {
+      "user": "U_A",
+      "ts": "1783694548.166149",
+      "text": "unsure where to find the ... menu; couldn't see it in the details view (PR-101)"
+    },
+    {
+      "user": "U_B",
+      "ts": "1783694668.166149",
+      "text": "Good instinct — that pop-out never renders the overflow menu, on this branch or main. Meaningful checks are build-green + a clean tag swap."
+    },
+    {
+      "user": "U_A",
+      "ts": "1783695448.166149",
+      "text": "Re-review checks pass — good to merge?"
+    },
+    {
+      "user": "U_B",
+      "ts": "1783695508.166149",
+      "text": "If you're good with it, we're good."
+    },
+    {
+      "user": "U_A",
+      "ts": "1783696048.166149",
+      "text": "Merged it."
+    },
+    {
+      "user": "U_B",
+      "ts": "1784147608.166149",
+      "text": "Pushed the follow-up review round on PR-202 if you want to take a look when you get a sec."
+    },
+    {
+      "user": "U_A",
+      "ts": "1784147968.166149",
+      "text": "sure, testing it now"
+    },
+    {
+      "user": "U_A",
+      "ts": "1784148148.166149",
+      "text": "Commented some things I noticed when testing PR-202."
+    }
+  ]
+}

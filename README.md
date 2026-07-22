@@ -318,7 +318,7 @@ anything else (write/mutating) returns `403` with no Slack call:
 ```bash
 TOKEN=$(cat ~/.local/state/slack-harvester/api-token)
 curl -s -H "Authorization: Bearer $TOKEN" \
-  'http://127.0.0.1:7777/slack?method=conversations.history&channel=D0AUM6S6HQS&latest=1784148148.166149&limit=16&inclusive=true' \
+  'http://127.0.0.1:7777/slack?method=conversations.history&channel=D0EXAMPLE01&latest=1784148148.166149&limit=16&inclusive=true' \
   | python3 -m json.tool
 ```
 

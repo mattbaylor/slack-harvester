@@ -241,8 +241,9 @@ def message_has_my_trigger_reaction(
     A message qualifies iff at least one entry in its inline `reactions[]` has
     BOTH (a) an emoji `name` in `trigger_reactions` AND (b) the authed user's id
     in that reaction's `users[]`. This is the reconciler's core match rule; it
-    deliberately mirrors what the primary hasmy: path finds (Matt's own trigger
-    reactions), just discovered via conversations.history instead of search.
+    deliberately mirrors what the primary hasmy: path finds (the authed user's
+    own trigger reactions), just discovered via conversations.history instead of
+    search.
 
     Correctly EXCLUDES:
     - other people's reactions (authed id not in that reaction's users[]),
@@ -858,8 +859,7 @@ class SlackClient:
         surfaces top-level channel messages. Using it with latest=<reply_ts>
         silently returns the top-level message at or before that ts, which
         is a completely unrelated message. That silent substitution caused
-        the wrong-content capture documented in
-        `~/vault/00-inbox/2026-07-01-slack-harvester-get-message-wrong-for-thread-replies.md`.
+        a wrong-content capture; see ISSUES.md.
 
         conversations.replies works for both cases:
         - If ts is a thread reply: returns parent + all replies; we pick
@@ -953,10 +953,10 @@ class SlackClient:
     # frontmatter, so nothing downstream ever sees a raw <@Uxxxx> id.
     #
     # Why this matters: opencode (the body generator) has no access to the
-    # user cache. If it receives a raw <@U0ATR90VBMJ>, it cannot resolve it
-    # and will hallucinate a plausible-but-wrong name by pattern-matching the
-    # surrounding text (observed 2026-07-13: mentioned "matt" rendered as
-    # "Marco Rangel" because the next sentence mentioned Marco). See ISSUES.md.
+    # user cache. If it receives a raw <@Uxxxx>, it cannot resolve it and will
+    # hallucinate a plausible-but-wrong name by pattern-matching the
+    # surrounding text (a mentioned handle got rendered as an unrelated name
+    # pulled from a later sentence). See ISSUES.md.
     _MENTION_RE = re.compile(
         r"<"
         r"(?:"
@@ -999,7 +999,7 @@ class SlackClient:
                 return self.resolve_channel(match.group("channel"))
             if match.group("subteam"):
                 label = match.group("slabel")
-                # Labels like "@team-articuno" already carry the @; keep as-is.
+                # Labels like "@some-group" already carry the @; keep as-is.
                 return label if label else f"@{match.group('subteam')}"
             if match.group("special"):
                 return f"@{match.group('special')}"
@@ -1311,7 +1311,7 @@ class Reconciler:
         self.interval_seconds = _resolve_reconcile_interval_seconds(state.config)
         self.window_seconds = _resolve_reconcile_window_seconds(state.config)
         # Optional config fallback list (SQ3): used only if users.conversations
-        # is not callable by the token. A list of channel IDs Matt maintains.
+        # is not callable by the token. A user-maintained list of channel IDs.
         self.channels_override = state.config.get("reconcile_channels") or []
         self.user_id: Optional[str] = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1480,9 +1480,8 @@ class CaptureWorker:
         msg = self.client.get_message(channel, ts)
         # Defensive: if get_message ever returns the wrong message (as it
         # historically did for thread replies via conversations.history —
-        # see ~/vault/00-inbox/2026-07-01-slack-harvester-get-message-wrong-for-thread-replies.md),
-        # fail loudly rather than silently populating the capture with the
-        # wrong content.
+        # see ISSUES.md), fail loudly rather than silently populating the
+        # capture with the wrong content.
         if msg.get("ts") != ts:
             raise RuntimeError(
                 f"get_message returned wrong message: asked for ts={ts}, "
@@ -1509,7 +1508,8 @@ class CaptureWorker:
         #      message dict so both the frontmatter and the opencode prompt
         #      only ever see names. Without (b), raw ids reach opencode, which
         #      cannot resolve them and hallucinates plausible-but-wrong names
-        #      (2026-07-13: "matt" rendered as "Marco Rangel"). See ISSUES.md.
+        #      (a mentioned handle got rendered as an unrelated name). See
+        #      ISSUES.md.
         participants = set()
         for m in messages:
             uid = m.get("user")

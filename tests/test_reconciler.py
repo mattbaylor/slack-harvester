@@ -46,7 +46,7 @@ from harvester import (  # noqa: E402
     select_new_and_mine,
 )
 
-ME = "U0ATR90VBMJ"          # the authed user id (Matt), per the plan
+ME = "U0EXAMPLE01"          # the authed user id (placeholder)
 OTHER = "U9999OTHER"
 TRIGGERS = {"eyes", "cap", "bookmark"}
 

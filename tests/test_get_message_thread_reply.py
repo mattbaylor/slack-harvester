@@ -1,157 +1,188 @@
 #!/usr/bin/env python3
-"""Regression test for the get_message thread-reply substitution bug.
+"""Hermetic regression test for the get_message thread-reply substitution bug.
 
-Verifies that SlackClient.get_message returns the correct message for both
-top-level messages and thread replies.
+Verifies that SlackClient.get_message returns the correct message for a
+top-level message, a thread reply, and a non-threaded message.
 
-Before the fix, get_message used conversations.history which silently
-returned an unrelated top-level message when asked for a thread reply's ts
-— see the 2026-07-01 bug nugget in the vault:
-  ~/vault/00-inbox/2026-07-01-slack-harvester-get-message-wrong-for-thread-replies.md
-
+Before the fix, get_message used conversations.history, which silently
+returned an unrelated top-level message when asked for a thread reply's ts.
 The fix routed get_message through conversations.replies, which returns the
-correct message whether ts is a parent or a reply. A defensive check in
+correct message whether ts is a parent or a reply; get_message then selects
+the element whose ts matches exactly. A defensive check in
 CaptureWorker._process now raises if get_message ever returns the wrong ts,
 so this class of failure can't be silent again.
 
-## Usage
+FULLY HERMETIC: no live Slack, no opencode, no Chrome, no network, no
+credentials. It stubs SlackClient._call (the single API seam get_message
+uses) with a synthetic thread and asserts the selection logic directly.
 
-Uses live Slack credentials read from the harvester's Chrome profile (same
-mechanism as the running harvester). Read-only — no writes to Slack, no
-writes to vault, no state mutation beyond the users-cache side effects of
-resolve_user (not exercised here).
+Run (from repo root):
+    python3 tests/test_get_message_thread_reply.py
+or with pytest:
+    pytest tests/test_get_message_thread_reply.py
 
-Config is read from ../config.json relative to this file.
-
-Run:
-  cd ~/repo/slack-harvester
-  PYTHONPATH=~/.local/lib/slack-harvester-deps python3 tests/test_get_message_thread_reply.py
-
-Exit codes:
-  0 — all cases passed
-  1 — one or more cases failed
-  2 — no Slack credentials available (probably need to sign into Slack in
-      the dedicated Chrome profile again)
-
-## Test-case durability
-
-The three ts values below live in a real Slack thread in #proj-graph-ui
-(channel C0AS0PPTFM3) on the Banno workspace. They will remain valid as
-long as those messages exist in Slack. If they're ever deleted or the
-channel is archived past the retention window, this test needs new fixtures
-— pick any thread with at least the parent + one reply and update CASES.
+Exit codes (script mode): 0 all pass, 1 one or more failures.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
-# Repo root is the parent of tests/.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from harvester import SlackClient, HarvesterState  # noqa: E402
+from harvester import SlackClient  # noqa: E402
 
-CONFIG = json.loads((REPO_ROOT / "config.json").read_text())
+CHANNEL = "C0000000000"
+PARENT_TS = "1700000000.000100"
+REPLY1_TS = "1700000100.000200"
+REPLY2_TS = "1700000200.000300"
+LONE_TS = "1700000300.000400"
+
+# A synthetic thread as conversations.replies would return it: parent first,
+# then replies in chronological order.
+THREAD = [
+    {"ts": PARENT_TS, "user": "U_AUTHOR", "text": "parent: please look at this"},
+    {"ts": REPLY1_TS, "user": "U_ONE", "thread_ts": PARENT_TS,
+     "text": "reply one with the rationale"},
+    {"ts": REPLY2_TS, "user": "U_TWO", "thread_ts": PARENT_TS,
+     "text": "reply two: no other cases to consider"},
+]
+
+# A non-threaded top-level message: conversations.replies returns a single
+# element with no thread_ts.
+LONE = [{"ts": LONE_TS, "user": "U_AUTHOR", "text": "a standalone message"}]
+
+
+def _make_client(messages: list[dict]) -> SlackClient:
+    """A SlackClient whose only API seam (_call) returns a fixed message list.
+
+    get_message calls self._call("conversations.replies", ...); we stub that
+    so no network/credentials are needed and the selection logic is isolated.
+    """
+    client = SlackClient.__new__(SlackClient)  # bypass __init__ (needs state)
+
+    def fake_call(method: str, params: dict) -> dict:
+        assert method == "conversations.replies", (
+            f"get_message must route through conversations.replies, got {method}"
+        )
+        return {"ok": True, "messages": messages}
+
+    client._call = fake_call  # type: ignore[method-assign]
+    return client
+
 
 CASES = [
     {
-        "label": "thread parent (Ethell / ARTI-298 bug ticket)",
-        "channel": "C0AS0PPTFM3",
-        "ts": "1782852023.839919",
-        "expect_text_contains": "Add this bug ticket related to dupe component registration",
+        "label": "thread parent",
+        "messages": THREAD,
+        "ts": PARENT_TS,
+        "expect_text_contains": "please look at this",
         "expect_is_reply": False,
     },
     {
-        "label": "thread reply #1 (John — Josh Langner rationale)",
-        "channel": "C0AS0PPTFM3",
-        "ts": "1782925533.567219",
-        "expect_text_contains": "Josh Langner",
+        "label": "thread reply #1",
+        "messages": THREAD,
+        "ts": REPLY1_TS,
+        "expect_text_contains": "the rationale",
         "expect_is_reply": True,
-        "expect_thread_ts": "1782852023.839919",
+        "expect_thread_ts": PARENT_TS,
     },
     {
-        "label": "thread reply #2 (David Ethell — 'no other types of import')",
-        "channel": "C0AS0PPTFM3",
-        "ts": "1782926787.843129",
-        "expect_text_contains": "other types of impor",
+        "label": "thread reply #2",
+        "messages": THREAD,
+        "ts": REPLY2_TS,
+        "expect_text_contains": "no other cases",
         "expect_is_reply": True,
-        "expect_thread_ts": "1782852023.839919",
+        "expect_thread_ts": PARENT_TS,
+    },
+    {
+        "label": "non-threaded top-level message",
+        "messages": LONE,
+        "ts": LONE_TS,
+        "expect_text_contains": "standalone",
+        "expect_is_reply": False,
     },
 ]
 
 
+def _run_case(case: dict) -> str | None:
+    """Return None on pass, or a failure string on failure."""
+    client = _make_client(case["messages"])
+    try:
+        msg = client.get_message(CHANNEL, case["ts"])
+    except Exception as e:  # noqa: BLE001
+        return f"{case['label']}: get_message raised {e!r}"
+
+    got_ts = msg.get("ts")
+    got_thread_ts = msg.get("thread_ts")
+
+    if got_ts != case["ts"]:
+        return f"{case['label']}: ts mismatch — asked {case['ts']}, got {got_ts}"
+
+    if case["expect_text_contains"] not in (msg.get("text") or ""):
+        return (f"{case['label']}: expected text to contain "
+                f"{case['expect_text_contains']!r}, got {(msg.get('text') or '')[:80]!r}")
+
+    if case["expect_is_reply"]:
+        if got_thread_ts != case.get("expect_thread_ts"):
+            return (f"{case['label']}: expected thread_ts="
+                    f"{case.get('expect_thread_ts')!r}, got {got_thread_ts!r}")
+    else:
+        if got_thread_ts is not None and got_thread_ts != case["ts"]:
+            return (f"{case['label']}: expected no thread_ts or thread_ts=="
+                    f"{case['ts']!r}, got {got_thread_ts!r}")
+    return None
+
+
+# Individual pytest-discoverable tests -------------------------------------
+
+def test_thread_parent() -> None:
+    assert _run_case(CASES[0]) is None
+
+
+def test_thread_reply_1() -> None:
+    assert _run_case(CASES[1]) is None
+
+
+def test_thread_reply_2() -> None:
+    assert _run_case(CASES[2]) is None
+
+
+def test_non_threaded_message() -> None:
+    assert _run_case(CASES[3]) is None
+
+
+def test_missing_ts_raises() -> None:
+    """Asking for a ts not in the returned thread raises, never substitutes."""
+    client = _make_client(THREAD)
+    raised = False
+    try:
+        client.get_message(CHANNEL, "1699999999.999999")
+    except RuntimeError:
+        raised = True
+    assert raised, "get_message must raise for an absent ts, not return a neighbor"
+
+
 def main() -> int:
-    state = HarvesterState(
-        vault=Path(CONFIG["vault_path"]).expanduser(),
-        capture_dir=CONFIG["capture_dir"],
-        chrome_profile=Path(CONFIG["chrome_profile"]).expanduser(),
-        state_dir=Path(CONFIG["state_dir"]).expanduser(),
-    )
-    if not state.has_credentials():
-        print("FAIL: no Slack credentials from Chrome profile", file=sys.stderr)
-        print("      sign into Slack in the dedicated Chrome profile and retry.",
-              file=sys.stderr)
-        return 2
-
-    client = SlackClient(state)
-
     failures = []
     for case in CASES:
         print(f"\n--- {case['label']}")
-        print(f"    channel={case['channel']} ts={case['ts']}")
-        try:
-            msg = client.get_message(case["channel"], case["ts"])
-        except Exception as e:
-            failures.append(f"{case['label']}: get_message raised {e!r}")
-            print(f"    FAIL: {e}")
-            continue
-
-        got_ts = msg.get("ts")
-        got_text = (msg.get("text") or "")[:120]
-        got_thread_ts = msg.get("thread_ts")
-        got_user = msg.get("user")
-
-        print(f"    got: ts={got_ts} thread_ts={got_thread_ts} user={got_user}")
-        print(f"    text[:120]={got_text!r}")
-
-        if got_ts != case["ts"]:
-            failures.append(
-                f"{case['label']}: ts mismatch — asked {case['ts']}, got {got_ts}"
-            )
-            print(f"    FAIL: ts mismatch")
-            continue
-
-        if case["expect_text_contains"] not in (msg.get("text") or ""):
-            failures.append(
-                f"{case['label']}: expected text to contain "
-                f"{case['expect_text_contains']!r}, got {got_text!r}"
-            )
-            print(f"    FAIL: text mismatch")
-            continue
-
-        if case["expect_is_reply"]:
-            if got_thread_ts != case.get("expect_thread_ts"):
-                failures.append(
-                    f"{case['label']}: expected thread_ts="
-                    f"{case.get('expect_thread_ts')!r}, got {got_thread_ts!r}"
-                )
-                print(f"    FAIL: thread_ts mismatch")
-                continue
+        print(f"    channel={CHANNEL} ts={case['ts']}")
+        err = _run_case(case)
+        if err:
+            failures.append(err)
+            print(f"    FAIL: {err}")
         else:
-            # Top-level messages: Slack sets thread_ts == ts on the parent
-            # once at least one reply exists. Either equal to ts, or None,
-            # is OK for a parent.
-            if got_thread_ts is not None and got_thread_ts != case["ts"]:
-                failures.append(
-                    f"{case['label']}: expected no thread_ts or thread_ts=={case['ts']!r}, "
-                    f"got {got_thread_ts!r}"
-                )
-                print(f"    FAIL: parent has unexpected thread_ts")
-                continue
+            print("    PASS")
 
-        print(f"    PASS")
+    print("\n--- absent ts raises")
+    try:
+        test_missing_ts_raises()
+        print("    PASS")
+    except AssertionError as e:
+        failures.append(f"absent-ts: {e}")
+        print(f"    FAIL: {e}")
 
     print("\n=== summary")
     if failures:
@@ -159,7 +190,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print(f"PASSED: {len(CASES)} cases")
+    print(f"PASSED: {len(CASES) + 1} cases")
     return 0
 
 

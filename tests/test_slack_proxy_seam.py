@@ -263,14 +263,14 @@ def test_error_envelope(failures: list) -> None:
 def test_query_parsing(failures: list) -> None:
     print("\n--- query-param parsing (method extracted, rest passed through)")
     method, params = parse_slack_query(
-        "/slack?method=conversations.history&channel=D0AUM6S6HQS"
+        "/slack?method=conversations.history&channel=D0EXAMPLE01"
         "&latest=1784148148.166149&limit=16&inclusive=true")
     _check(failures, "method extracted", method == "conversations.history",
            f"got {method}")
     _check(failures, "method removed from passthrough params",
            "method" not in params, f"params={params}")
     _check(failures, "channel passed through",
-           params.get("channel") == "D0AUM6S6HQS", f"params={params}")
+           params.get("channel") == "D0EXAMPLE01", f"params={params}")
     _check(failures, "latest passed through",
            params.get("latest") == "1784148148.166149", f"params={params}")
     _check(failures, "limit passed through", params.get("limit") == "16")
