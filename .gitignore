@@ -27,3 +27,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Playwright MCP session artifacts (local browser-automation logs/snapshots)
+.playwright-mcp/
